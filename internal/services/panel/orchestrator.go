@@ -1,0 +1,463 @@
+package panel
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
+
+	"gorm.io/gorm"
+
+	"github.com/hann0w0/singbox-panel/internal/domain/model"
+	"github.com/hann0w0/singbox-panel/internal/domain/protocol"
+	"github.com/hann0w0/singbox-panel/internal/domain/singbox"
+)
+
+// Orchestrator builds server configs from the database and pushes them to agents.
+type Orchestrator struct {
+	db    *gorm.DB
+	hub   *Hub
+	locks *keyedMutex[uint]
+	// app resolves node-imported outbounds against their live source. Set by
+	// NewApp; nil in tests that build an orchestrator directly, where such
+	// outbounds keep their imported snapshot.
+	app *App
+
+	asyncMu      sync.Mutex
+	asyncRunning map[uint]bool
+	asyncPending map[uint]bool
+}
+
+// app returns the panel that owns this orchestrator, or a bare App backed by
+// the same database when tests construct one without a panel.
+func (o *Orchestrator) appOrFallback() *App {
+	if o.app != nil {
+		return o.app
+	}
+	return &App{db: o.db}
+}
+
+type ConfigApplyState string
+
+const (
+	ConfigApplied       ConfigApplyState = "applied"
+	ConfigPending       ConfigApplyState = "pending"
+	ConfigFailed        ConfigApplyState = "failed"
+	asyncPushAttempts                    = 3
+	asyncPushRetryDelay                  = 2 * time.Second
+)
+
+// ConfigApplyResult separates persistence from delivery. Structured edits are
+// always saved first; callers can then tell the UI whether the desired config
+// is active, waiting for an offline Agent, or rejected by an online node.
+type ConfigApplyResult struct {
+	ApplyState ConfigApplyState `json:"apply_state"`
+	ApplyError string           `json:"apply_error,omitempty"`
+}
+
+// NewOrchestrator builds an Orchestrator.
+func NewOrchestrator(db *gorm.DB, hub *Hub) *Orchestrator {
+	return &Orchestrator{
+		db: db, hub: hub, locks: newKeyedMutex[uint](),
+		asyncRunning: make(map[uint]bool), asyncPending: make(map[uint]bool),
+	}
+}
+
+func (o *Orchestrator) lockServer(serverID uint) func() {
+	return o.locks.lock(serverID)
+}
+
+// BuildServerConfig assembles a server's full official config.json from the DB.
+func (o *Orchestrator) BuildServerConfig(srv *model.Server) ([]byte, error) {
+	if srv.EffectiveConfigMode() == model.ConfigModeRaw {
+		if !json.Valid(srv.RawConfig) {
+			return nil, fmt.Errorf("server raw config is not valid JSON")
+		}
+		return append([]byte(nil), srv.RawConfig...), nil
+	}
+	var inbounds []model.Inbound
+	if err := o.db.Where("server_id = ? AND enabled = ?", srv.ID, true).Find(&inbounds).Error; err != nil {
+		return nil, fmt.Errorf("load inbounds for server %d: %w", srv.ID, err)
+	}
+
+	ins := make([]singbox.InboundInput, 0, len(inbounds))
+	for _, ib := range inbounds {
+		var st singbox.InboundSettings
+		if len(ib.Settings) > 0 {
+			if err := json.Unmarshal(ib.Settings, &st); err != nil {
+				return nil, fmt.Errorf("inbound %q settings: %w", ib.Tag, err)
+			}
+		}
+		if err := st.ValidateMultiUser(string(ib.Type)); err != nil {
+			return nil, fmt.Errorf("inbound %q settings: %w", ib.Tag, err)
+		}
+		var users []singbox.ProxyUser
+		if st.UseMultiUser(string(ib.Type)) {
+			st.SingleUser = false
+			loadedUsers, loadErr := proxyUsersForInbound(o.db, &ib, st)
+			if loadErr != nil {
+				return nil, fmt.Errorf("load users for inbound %q: %w", ib.Tag, loadErr)
+			}
+			users = loadedUsers
+			// Other servers may route through this inbound; each consumer needs
+			// its own dedicated credential in this server's config.
+			routingUsers, routeErr := routingIdentitiesForInbound(o.db, srv, ib.ID)
+			if routeErr != nil {
+				return nil, fmt.Errorf("load routing users for inbound %q: %w", ib.Tag, routeErr)
+			}
+			users = append(users, routingUsers...)
+		} else {
+			st.MultiUser = false
+			st.SingleUser = true
+		}
+		ins = append(ins, singbox.InboundInput{
+			Tag:        ib.Tag,
+			Type:       string(ib.Type),
+			ListenPort: ib.ListenPort,
+			Settings:   st,
+			Users:      users,
+		})
+	}
+
+	// Outbounds (direct + landing proxies).
+	var obRows []model.Outbound
+	if err := o.db.Where("server_id = ?", srv.ID).Order("sort").Find(&obRows).Error; err != nil {
+		return nil, fmt.Errorf("load outbounds for server %d: %w", srv.ID, err)
+	}
+	obs := make([]singbox.OutboundInput, 0, len(obRows))
+	for _, ob := range obRows {
+		var os outboundStoredSettings
+		if len(ob.Settings) > 0 {
+			if err := json.Unmarshal(ob.Settings, &os); err != nil {
+				return nil, fmt.Errorf("outbound %q settings: %w", ob.Tag, err)
+			}
+		}
+		// Node-imported outbounds follow their source, so edits there apply
+		// without re-importing. A source that became unusable falls back to the
+		// snapshot taken at import time: a stale route still beats dropping the
+		// outbound (which every rule referencing it would then lose).
+		if ob.Referenced() {
+			if client, err := o.appOrFallback().outboundSourceClient(&ob, srv.ID); err == nil {
+				os = outboundStoredSettings{
+					Server: client.Server, ServerPort: client.ServerPort,
+					UUID: client.User.UUID, Username: client.User.Username, Password: client.User.Password,
+					Settings: client.Settings,
+				}
+				ob.Type = client.Type
+			} else {
+				log.Printf("orchestrator: outbound %q on server %d keeps its imported snapshot: %v", ob.Tag, srv.ID, err)
+			}
+		}
+		obs = append(obs, singbox.OutboundInput{
+			Tag: ob.Tag, Type: ob.Type,
+			Server: os.Server, ServerPort: os.ServerPort,
+			Username: os.Username, UUID: os.UUID, Password: os.Password, Settings: os.Settings,
+		})
+	}
+
+	// Route rules.
+	var ruleRows []model.RouteRule
+	if err := o.db.Where("server_id = ? AND enabled = ?", srv.ID, true).Order("sort").Find(&ruleRows).Error; err != nil {
+		return nil, fmt.Errorf("load route rules for server %d: %w", srv.ID, err)
+	}
+	rules := make([]singbox.RuleInput, 0, len(ruleRows))
+	for _, r := range ruleRows {
+		var ri singbox.RuleInput
+		if len(r.Match) > 0 {
+			if err := json.Unmarshal(r.Match, &ri); err != nil {
+				return nil, fmt.Errorf("route rule %d match: %w", r.ID, err)
+			}
+		}
+		ri.Outbound = r.Outbound
+		rules = append(rules, ri)
+	}
+
+	// Rule-sets.
+	var rsRows []model.RuleSet
+	if err := o.db.Where("server_id = ?", srv.ID).Find(&rsRows).Error; err != nil {
+		return nil, fmt.Errorf("load rule sets for server %d: %w", srv.ID, err)
+	}
+	rsets := make([]singbox.RuleSetInput, 0, len(rsRows))
+	for _, rs := range rsRows {
+		rsets = append(rsets, singbox.RuleSetInput{
+			Tag: rs.Tag, Type: rs.Type, URL: rs.URL, Path: rs.Path, Format: rs.Format,
+			DownloadDetour: rs.DownloadDetour, UpdateInterval: rs.UpdateInterval,
+		})
+	}
+
+	return singbox.BuildServerConfig(singbox.ServerConfigInput{
+		Inbounds:        ins,
+		Outbounds:       obs,
+		Rules:           rules,
+		RuleSets:        rsets,
+		Final:           srv.FinalOutbound,
+		StatsController: protocol.LocalTrafficAddress,
+		StatsSecret:     statsSecret(srv.AgentToken),
+		StatsAPI:        statsAPIAddress(srv, inbounds),
+	})
+}
+
+// statsSecret derives the per-node secret protecting the loopback stats
+// endpoints. It is deterministic so repeated pushes produce identical configs
+// (no needless sing-box restarts), and only the Agent (which reads it from the
+// node's config) and the panel can know it.
+func statsSecret(agentToken string) string {
+	if agentToken == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(agentToken))
+	mac.Write([]byte("singbox-panel stats"))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// statsAPIAddress enables the sing-box API service only when the node runs a
+// release that has it (1.14.0+), the node has a secret, and no enabled
+// inbound already listens on the service port. Otherwise the Agent keeps the
+// Clash-only (per-port) accounting.
+func statsAPIAddress(srv *model.Server, inbounds []model.Inbound) string {
+	if !statsAPISupported(srv.SingboxVersion) || srv.AgentToken == "" {
+		return ""
+	}
+	port := addressPort(protocol.LocalStatsAPIAddress)
+	for _, inbound := range inbounds {
+		if inbound.ListenPort == port {
+			return ""
+		}
+	}
+	return protocol.LocalStatsAPIAddress
+}
+
+// statsAPISupported reports whether a sing-box version string is a release
+// with the API service (1.14.0 and later; 1.14 pre-releases are excluded).
+func statsAPISupported(version string) bool {
+	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
+	if version == "" {
+		return false
+	}
+	return compareSemver(version, "1.14.0") >= 0
+}
+
+// ApplyDesiredConfig synchronously attempts to activate the saved desired
+// state. Offline nodes are pending because AfterRegister reconciles them on the
+// next connection; all other errors are reported as failed instead of being
+// hidden behind a successful database response.
+func (o *Orchestrator) ApplyDesiredConfig(ctx context.Context, serverID uint) ConfigApplyResult {
+	// Persist the fact that even an empty generated config is intentional. This
+	// makes an offline delete of the final inbound/outbound reconcile correctly
+	// after reconnect instead of being mistaken for a never-configured node.
+	if err := o.db.Model(&model.Server{}).Where("id = ?", serverID).Update("config_initialized", true).Error; err != nil {
+		return ConfigApplyResult{ApplyState: ConfigFailed, ApplyError: "mark desired config initialized: " + err.Error()}
+	}
+	err := o.PushConfigWithTimeout(ctx, serverID, 55*time.Second)
+	if err == nil {
+		return ConfigApplyResult{ApplyState: ConfigApplied}
+	}
+	if errors.Is(err, ErrAgentOffline) {
+		return ConfigApplyResult{ApplyState: ConfigPending}
+	}
+	return ConfigApplyResult{ApplyState: ConfigFailed, ApplyError: err.Error()}
+}
+
+// PushConfig builds and applies a server's config, blocking on the agent's ack.
+func (o *Orchestrator) PushConfig(ctx context.Context, serverID uint) error {
+	unlock := o.lockServer(serverID)
+	defer unlock()
+	return o.pushConfigUnlocked(ctx, serverID)
+}
+
+// PushConfigWithTimeout starts the command timeout only after the per-server
+// configuration lock has been acquired. Waiting behind another apply must not
+// consume the entire delivery window before this operation can start.
+func (o *Orchestrator) PushConfigWithTimeout(ctx context.Context, serverID uint, timeout time.Duration) error {
+	unlock := o.lockServer(serverID)
+	defer unlock()
+	commandCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return o.pushConfigUnlocked(commandCtx, serverID)
+}
+
+func (o *Orchestrator) pushConfigUnlocked(ctx context.Context, serverID uint) error {
+	var srv model.Server
+	if err := o.db.First(&srv, serverID).Error; err != nil {
+		return err
+	}
+	raw, err := o.BuildServerConfig(&srv)
+	if err == nil {
+		_, err = o.hub.SendCommand(ctx, serverID, protocol.CmdApplyConfig, protocol.ApplyConfigCmd{Config: raw})
+	}
+	if srv.ProxySyncRevision > srv.ProxySyncAppliedRevision {
+		updates := map[string]any{"proxy_sync_failed": err != nil && !errors.Is(err, ErrAgentOffline)}
+		if err == nil {
+			updates["proxy_sync_applied_revision"] = srv.ProxySyncRevision
+		}
+		// A newer reset may commit while this config is in flight. Its revision
+		// must remain pending even when this older command succeeds.
+		if saveErr := o.db.Model(&model.Server{}).
+			Where("id = ? AND proxy_sync_revision = ?", serverID, srv.ProxySyncRevision).
+			Updates(updates).Error; saveErr != nil {
+			return errors.Join(err, fmt.Errorf("record credential synchronization: %w", saveErr))
+		}
+	}
+	return err
+}
+
+// ApplyRawConfig changes the desired source of truth and applies it as one
+// serialized operation. If the Agent rejects the config, the previous database
+// mode/snapshot is restored so reconnects cannot overwrite the running node with
+// a half-saved edit.
+func (o *Orchestrator) ApplyRawConfig(ctx context.Context, serverID uint, raw []byte) (protocol.CommandResultEvt, error) {
+	unlock := o.lockServer(serverID)
+	defer unlock()
+	return o.applyRawConfigUnlocked(ctx, serverID, raw)
+}
+
+// applyRawConfigUnlocked applies and persists raw JSON while the caller owns
+// the server configuration lock. The API uses it to keep the subsequent
+// structured-view synchronization in the same serialized operation.
+func (o *Orchestrator) applyRawConfigUnlocked(ctx context.Context, serverID uint, raw []byte) (protocol.CommandResultEvt, error) {
+	var old model.Server
+	if err := o.db.Select("id", "config_mode", "raw_config", "config_initialized").First(&old, serverID).Error; err != nil {
+		return protocol.CommandResultEvt{}, err
+	}
+	if err := o.db.Model(&model.Server{}).Where("id = ?", serverID).Updates(map[string]any{
+		"config_mode": model.ConfigModeRaw,
+		"raw_config":  model.JSONText(append([]byte(nil), raw...)),
+	}).Error; err != nil {
+		return protocol.CommandResultEvt{}, err
+	}
+	res, err := o.hub.SendCommand(ctx, serverID, protocol.CmdApplyConfig, protocol.ApplyConfigCmd{Config: json.RawMessage(raw)})
+	if err != nil {
+		if rollbackErr := o.db.Model(&model.Server{}).Where("id = ?", serverID).Updates(map[string]any{
+			"config_mode": old.ConfigMode,
+			"raw_config":  old.RawConfig,
+		}).Error; rollbackErr != nil {
+			return res, fmt.Errorf("apply raw config: %v; restore raw snapshot: %w", err, rollbackErr)
+		}
+		return res, err
+	}
+	return res, nil
+}
+
+// SwitchToManagedConfig serializes the mode change with every other config
+// apply. The database is changed before the generated config is built, and is
+// restored if the Agent rejects or cannot receive it.
+func (o *Orchestrator) SwitchToManagedConfig(ctx context.Context, serverID uint) error {
+	unlock := o.lockServer(serverID)
+	defer unlock()
+
+	var old model.Server
+	if err := o.db.Select("id", "config_mode", "raw_config", "config_initialized").First(&old, serverID).Error; err != nil {
+		return err
+	}
+	if err := o.db.Model(&model.Server{}).Where("id = ?", serverID).Updates(map[string]any{
+		"config_mode":        model.ConfigModeManaged,
+		"config_initialized": true,
+	}).Error; err != nil {
+		return err
+	}
+	if err := o.pushConfigUnlocked(ctx, serverID); err != nil {
+		if rollbackErr := o.db.Model(&model.Server{}).Where("id = ?", serverID).Updates(map[string]any{
+			"config_mode":        old.ConfigMode,
+			"config_initialized": old.ConfigInitialized,
+		}).Error; rollbackErr != nil {
+			return fmt.Errorf("push managed config: %v; restore config mode: %w", err, rollbackErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// PushConfigAsync pushes in the background, ignoring offline agents.
+func (o *Orchestrator) PushConfigAsync(serverID uint) {
+	o.asyncMu.Lock()
+	if o.asyncRunning[serverID] {
+		o.asyncPending[serverID] = true
+		o.asyncMu.Unlock()
+		return
+	}
+	o.asyncRunning[serverID] = true
+	o.asyncMu.Unlock()
+
+	go func() {
+		for {
+			var err error
+			for attempt := 1; attempt <= asyncPushAttempts; attempt++ {
+				err = o.PushConfigWithTimeout(context.Background(), serverID, 60*time.Second)
+				if err == nil || errors.Is(err, ErrAgentOffline) {
+					break
+				}
+				log.Printf("orchestrator: push config to server %d failed (attempt %d/%d): %v", serverID, attempt, asyncPushAttempts, err)
+				if attempt < asyncPushAttempts {
+					time.Sleep(asyncPushRetryDelay)
+				}
+			}
+			if err != nil && !errors.Is(err, ErrAgentOffline) {
+				log.Printf("orchestrator: push config to server %d exhausted retries: %v", serverID, err)
+			}
+
+			o.asyncMu.Lock()
+			if o.asyncPending[serverID] {
+				delete(o.asyncPending, serverID)
+				o.asyncMu.Unlock()
+				continue
+			}
+			delete(o.asyncRunning, serverID)
+			o.asyncMu.Unlock()
+			return
+		}
+	}()
+}
+
+// PushConfigIfManaged reconciles nodes that have a raw config, structured
+// records, or an explicitly initialized (possibly empty) managed config. A
+// brand-new node remains untouched until the administrator first manages it.
+func (o *Orchestrator) PushConfigIfManaged(serverID uint) {
+	managed, err := o.serverIsManaged(serverID)
+	if err != nil {
+		log.Printf("orchestrator: inspect desired config for server %d: %v", serverID, err)
+		return
+	}
+	if managed {
+		o.PushConfigAsync(serverID)
+	}
+}
+
+func (o *Orchestrator) serverIsManaged(serverID uint) (bool, error) {
+	var srv model.Server
+	if err := o.db.Select("config_mode", "raw_config", "config_initialized").First(&srv, serverID).Error; err != nil {
+		return false, err
+	}
+	if srv.EffectiveConfigMode() == model.ConfigModeRaw || srv.ConfigInitialized {
+		return true, nil
+	}
+	var n int64
+	if err := o.db.Model(&model.Inbound{}).Where("server_id = ?", serverID).Count(&n).Error; err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return true, nil
+	}
+	if err := o.db.Model(&model.Outbound{}).Where("server_id = ?", serverID).Count(&n).Error; err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return true, nil
+	}
+	if err := o.db.Model(&model.RouteRule{}).Where("server_id = ?", serverID).Count(&n).Error; err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return true, nil
+	}
+	if err := o.db.Model(&model.RuleSet{}).Where("server_id = ?", serverID).Count(&n).Error; err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}

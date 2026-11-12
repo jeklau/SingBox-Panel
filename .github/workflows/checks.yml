@@ -1,0 +1,89 @@
+name: Check changes
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Backend and frontend checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Check Docker helper scripts
+        run: |
+          python3 scripts/test-docker-metadata.py
+          python3 scripts/test-docker-smoke.py
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.6'
+          cache: true
+
+      - name: Check backend
+        run: |
+          go test ./...
+          go vet ./...
+
+      - name: Check frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm test
+          npm run typecheck
+          npm run build
+
+  docker:
+    name: Docker deployment smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Resolve checked-out commit
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build panel image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          load: true
+          tags: singbox-panel:docker-test
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ steps.revision.outputs.sha }}
+          cache-from: type=gha,scope=panel-docker
+          cache-to: type=gha,mode=max,scope=panel-docker
+      - name: Verify Docker deployment and native Agent downloads
+        run: python3 scripts/docker-smoke.py --image singbox-panel:docker-test
+
+  publish:
+    name: Publish main image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [check, docker]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml

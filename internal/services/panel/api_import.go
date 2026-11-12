@@ -1,0 +1,527 @@
+package panel
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"strconv"
+	"time"
+
+	"gorm.io/gorm"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/hann0w0/singbox-panel/internal/domain/model"
+	"github.com/hann0w0/singbox-panel/internal/domain/protocol"
+	"github.com/hann0w0/singbox-panel/internal/domain/singbox"
+)
+
+type importReq struct {
+	// Config, when non-empty, is parsed instead of reading the agent's file.
+	Config string `json:"config"`
+	// DryRun only reports what would be imported, changing nothing.
+	DryRun bool `json:"dry_run"`
+}
+
+// importSummary is what the UI shows before/after an import.
+type importSummary struct {
+	Inbounds  []importedInbound `json:"inbounds"`
+	Outbounds []importedItem    `json:"outbounds"`
+	Rules     []importedRule    `json:"rules"`
+	RuleSets  []importedItem    `json:"rulesets"`
+	Final     string            `json:"final"`
+	Skipped   []string          `json:"skipped"`
+}
+
+type importedInbound struct {
+	Tag        string `json:"tag"`
+	Type       string `json:"type"`
+	ListenPort int    `json:"listen_port"`
+	SingleUser bool   `json:"single_user"`
+	Users      int    `json:"users"`
+}
+
+type importedItem struct {
+	Tag  string `json:"tag"`
+	Type string `json:"type"`
+	Info string `json:"info"`
+}
+
+type importedRule struct {
+	Inbound  []string `json:"inbound"`
+	Outbound string   `json:"outbound"`
+	Info     string   `json:"info"`
+}
+
+// fetchRemoteConfigRaw asks the agent for the server's current config.json.
+func (a *App) fetchRemoteConfigRaw(ctx context.Context, serverID uint) (string, error) {
+	res, err := a.hub.SendCommand(ctx, serverID, protocol.CmdGetConfig, nil)
+	if err != nil {
+		return "", err
+	}
+	var data protocol.ConfigData
+	if err := json.Unmarshal(res.Data, &data); err != nil {
+		return "", fmt.Errorf("解析 Agent 返回失败: %w", err)
+	}
+	if !data.Exists {
+		return "", fmt.Errorf("该服务器上没有 %s", data.Path)
+	}
+	return data.Raw, nil
+}
+
+// importRemoteConfig adopts an existing sing-box config into the panel: it
+// parses the server's config.json (or a pasted one) and replaces this server's
+// panel-side inbounds/outbounds/rules with what the file actually contains.
+func (a *App) importRemoteConfig(c *gin.Context) {
+	id, ok := uintParam(c, "id")
+	if !ok {
+		return
+	}
+	unlockOperation := a.lockServerOperation(id)
+	defer unlockOperation()
+	var srv model.Server
+	if err := a.db.First(&srv, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
+		return
+	}
+	var req importReq
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	raw := req.Config
+	if raw == "" {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+		defer cancel()
+		var err error
+		if raw, err = a.fetchRemoteConfigRaw(ctx, id); err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	parsed, err := singbox.ParseServerConfig([]byte(raw))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	sum := buildImportSummary(parsed)
+	if req.DryRun {
+		c.JSON(http.StatusOK, gin.H{"summary": sum, "dry_run": true})
+		return
+	}
+	// Replace this server's panel-side routing model with the parsed one. The
+	// server's own config file is untouched — importing only teaches the panel
+	// what is already running there.
+	if err := a.applyImport(&srv, parsed, []byte(raw)); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errInboundTrafficTagReserved) {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "summary": sum})
+}
+
+func buildImportSummary(p *singbox.ParsedConfig) importSummary {
+	sum := importSummary{Final: p.Final, Skipped: p.Skipped}
+	for _, in := range p.Inbounds {
+		sum.Inbounds = append(sum.Inbounds, importedInbound{
+			Tag: in.Tag, Type: in.Type, ListenPort: in.ListenPort,
+			SingleUser: in.Settings.SingleUser, Users: in.UserCount,
+		})
+	}
+	for _, ob := range p.Outbounds {
+		sum.Outbounds = append(sum.Outbounds, importedItem{
+			Tag: ob.Tag, Type: ob.Type, Info: fmt.Sprintf("%s:%d", ob.Server, ob.ServerPort),
+		})
+	}
+	for _, r := range p.Rules {
+		info := ""
+		if n := len(r.Match.DomainSuffix) + len(r.Match.Domain); n > 0 {
+			info = fmt.Sprintf("域名×%d", n)
+		}
+		if n := len(r.Match.IPCIDR); n > 0 {
+			info += fmt.Sprintf(" IP×%d", n)
+		}
+		sum.Rules = append(sum.Rules, importedRule{Inbound: r.Match.Inbound, Outbound: r.Outbound, Info: info})
+	}
+	for _, rs := range p.RuleSets {
+		sum.RuleSets = append(sum.RuleSets, importedItem{Tag: rs.Tag, Type: rs.Format, Info: rs.URL})
+	}
+	return sum
+}
+
+// applyImport writes the parsed view of a raw config into the DB. Existing
+// rows with the same tag keep their IDs so per-inbound user grants do not break
+// whenever an administrator imports or edits config.json. A lossless round
+// trip is promoted to managed mode automatically; otherwise raw JSON remains
+// the source of truth so fields the panel cannot model are never discarded.
+func (a *App) applyImport(srv *model.Server, p *singbox.ParsedConfig, raw []byte) error {
+	// Import changes both the structured rows and the raw source-of-truth mode.
+	// Serialize it with reconnect pushes, raw edits and explicit mode switches so
+	// no concurrent operation can observe or apply a half-transitioned state.
+	unlock := a.orch.lockServer(srv.ID)
+	defer unlock()
+	return a.applyImportUnlocked(srv, p, raw)
+}
+
+// applyImportUnlocked performs the database transaction while the caller owns
+// the server configuration lock.
+func (a *App) applyImportUnlocked(srv *model.Server, p *singbox.ParsedConfig, raw []byte) error {
+	a.userAccessMu.Lock()
+	defer a.userAccessMu.Unlock()
+	mode := importedConfigMode(p, raw)
+	return a.db.Transaction(func(tx *gorm.DB) error {
+		if err := validateImportedInboundTrafficTags(tx, srv.ID, raw); err != nil {
+			return err
+		}
+		if err := syncImportedInbounds(tx, srv.ID, p.Inbounds); err != nil {
+			return err
+		}
+		if err := syncImportedOutbounds(tx, srv.ID, p.Outbounds); err != nil {
+			return err
+		}
+		if err := replaceImportedRules(tx, srv.ID, p.Rules); err != nil {
+			return err
+		}
+		if err := syncImportedRuleSets(tx, srv.ID, p.RuleSets); err != nil {
+			return err
+		}
+		return tx.Model(&model.Server{}).Where("id = ?", srv.ID).Updates(map[string]any{
+			"final_outbound":     p.Final,
+			"config_mode":        mode,
+			"raw_config":         model.JSONText(append([]byte(nil), raw...)),
+			"config_initialized": true,
+		}).Error
+	})
+}
+
+func importedConfigMode(p *singbox.ParsedConfig, raw []byte) string {
+	// Subscription parsers can understand more client types than the managed
+	// server editor. Keep those whole-server imports editable as raw JSON.
+	for _, outbound := range p.Outbounds {
+		if !supportedOutboundTypes[outbound.Type] {
+			return model.ConfigModeRaw
+		}
+	}
+	// The real orchestrator adds panel statistics services even when they were
+	// absent in the imported JSON. Do not promote a gate that occupies those
+	// reserved ports: the raw configuration may work but managed pushes cannot.
+	for _, in := range p.Inbounds {
+		if !in.Settings.RealityGuardEnabled() {
+			continue
+		}
+		for _, port := range []int{in.ListenPort, in.Settings.TLS.Reality.Guard.InternalPort} {
+			if port == localTrafficPort() || port == addressPort(protocol.LocalStatsAPIAddress) {
+				return model.ConfigModeRaw
+			}
+		}
+	}
+	generated, err := buildManagedConfigFromImport(p, raw)
+	if err != nil {
+		return model.ConfigModeRaw
+	}
+	// Configs written by an older panel carry the narrower loopback guard; treat
+	// it as the current one so they stay managed and receive it on next push.
+	raw = singbox.UpgradeLegacyLoopbackGuardJSON(raw)
+	if equivalentJSON(raw, generated) {
+		return model.ConfigModeManaged
+	}
+	// Only an independently recognised, unambiguous REALITY gate may use
+	// these finite normalisations. All other imports retain strict equality.
+	normalizedRaw, rawOK := singbox.NormalizeRealityGuardImportJSON(raw)
+	normalizedGenerated, generatedOK := singbox.NormalizeRealityGuardImportJSON(generated)
+	if rawOK && generatedOK && equivalentJSON(normalizedRaw, normalizedGenerated) {
+		return model.ConfigModeManaged
+	}
+	return model.ConfigModeRaw
+}
+
+func buildManagedConfigFromImport(p *singbox.ParsedConfig, raw []byte) ([]byte, error) {
+	inbounds := make([]singbox.InboundInput, 0, len(p.Inbounds))
+	for _, inbound := range p.Inbounds {
+		settings := inbound.Settings
+		// Managed mode intentionally emits one credential per inbound. A manual
+		// multi-user config therefore cannot pass the lossless comparison.
+		settings.SingleUser = true
+		inbounds = append(inbounds, singbox.InboundInput{
+			Tag: inbound.Tag, Type: inbound.Type, ListenPort: inbound.ListenPort, Settings: settings,
+		})
+	}
+	outbounds := make([]singbox.OutboundInput, 0, len(p.Outbounds))
+	for _, outbound := range p.Outbounds {
+		outbounds = append(outbounds, singbox.OutboundInput(outbound))
+	}
+	rules := make([]singbox.RuleInput, 0, len(p.Rules))
+	for _, parsedRule := range p.Rules {
+		rule := parsedRule.Match
+		rule.Outbound = parsedRule.Outbound
+		rules = append(rules, rule)
+	}
+	statsController, statsSecretValue, statsAPI := importedStatsSettings(raw)
+	return singbox.BuildServerConfig(singbox.ServerConfigInput{
+		Inbounds: inbounds, Outbounds: outbounds, Rules: rules,
+		RuleSets: p.RuleSets, Final: p.Final, StatsController: statsController,
+		StatsSecret: statsSecretValue, StatsAPI: statsAPI,
+	})
+}
+
+// rawConfigSecurityWarnings flags control endpoints without a secret. A
+// proxy user can reach the node's loopback interface through the proxy, so an
+// unauthenticated Clash API or API service exposes every user's connections
+// and lets anyone close them.
+func rawConfigSecurityWarnings(raw []byte) []string {
+	var root struct {
+		Experimental struct {
+			ClashAPI struct {
+				ExternalController string `json:"external_controller"`
+				Secret             string `json:"secret"`
+			} `json:"clash_api"`
+		} `json:"experimental"`
+		Services []struct {
+			Type       string `json:"type"`
+			Tag        string `json:"tag"`
+			Listen     string `json:"listen"`
+			ListenPort int    `json:"listen_port"`
+			Secret     string `json:"secret"`
+		} `json:"services"`
+	}
+	if json.Unmarshal(raw, &root) != nil {
+		return nil
+	}
+	warnings := []string{}
+	clash := root.Experimental.ClashAPI
+	if clash.ExternalController != "" && clash.Secret == "" {
+		warnings = append(warnings, fmt.Sprintf("Clash API（%s）未设置 secret：代理用户可经节点访问它，查看他人连接或断开所有连接", clash.ExternalController))
+	}
+	for _, service := range root.Services {
+		if service.Type == "api" && service.Secret == "" {
+			warnings = append(warnings, fmt.Sprintf("API 服务 %s（%s）未设置 secret：代理用户可经节点访问它并控制 sing-box",
+				service.Tag, net.JoinHostPort(service.Listen, strconv.Itoa(service.ListenPort))))
+		}
+	}
+	return warnings
+}
+
+// importedStatsSettings recovers the panel's own stats hooks from an imported
+// config so a panel-generated config compares losslessly and stays managed.
+// Only the exact shapes the panel emits are recognised.
+func importedStatsSettings(raw []byte) (controller, secret, api string) {
+	var root struct {
+		Experimental struct {
+			ClashAPI struct {
+				ExternalController string `json:"external_controller"`
+				Secret             string `json:"secret"`
+			} `json:"clash_api"`
+		} `json:"experimental"`
+		Services []struct {
+			Type       string `json:"type"`
+			Tag        string `json:"tag"`
+			Listen     string `json:"listen"`
+			ListenPort int    `json:"listen_port"`
+			Secret     string `json:"secret"`
+		} `json:"services"`
+	}
+	if json.Unmarshal(raw, &root) != nil || root.Experimental.ClashAPI.ExternalController != protocol.LocalTrafficAddress {
+		return "", "", ""
+	}
+	controller = protocol.LocalTrafficAddress
+	secret = root.Experimental.ClashAPI.Secret
+	if secret != "" && len(root.Services) == 1 {
+		service := root.Services[0]
+		address := net.JoinHostPort(service.Listen, strconv.Itoa(service.ListenPort))
+		if service.Type == "api" && service.Tag == singbox.StatsServiceTag &&
+			service.Secret == secret && address == protocol.LocalStatsAPIAddress {
+			api = protocol.LocalStatsAPIAddress
+		}
+	}
+	return controller, secret, api
+}
+
+func equivalentJSON(left, right []byte) bool {
+	var leftValue any
+	var rightValue any
+	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
+		return false
+	}
+	leftCanonical, err := json.Marshal(leftValue)
+	if err != nil {
+		return false
+	}
+	rightCanonical, err := json.Marshal(rightValue)
+	return err == nil && string(leftCanonical) == string(rightCanonical)
+}
+
+func deleteRowsExcept(tx *gorm.DB, serverID uint, keepIDs []uint, row any) error {
+	query := tx.Where("server_id = ?", serverID)
+	if len(keepIDs) > 0 {
+		query = query.Where("id NOT IN ?", keepIDs)
+	}
+	return query.Delete(row).Error
+}
+
+func syncImportedInbounds(tx *gorm.DB, serverID uint, parsed []singbox.ParsedInbound) error {
+	var existing []model.Inbound
+	if err := tx.Where("server_id = ?", serverID).Find(&existing).Error; err != nil {
+		return err
+	}
+	byTag := make(map[string]*model.Inbound, len(existing))
+	for i := range existing {
+		if err := rememberInboundTrafficTag(tx, &existing[i]); err != nil {
+			return err
+		}
+		byTag[existing[i].Tag] = &existing[i]
+	}
+	keepIDs := make([]uint, 0, len(parsed))
+	for _, in := range parsed {
+		settings, err := json.Marshal(in.Settings)
+		if err != nil {
+			return err
+		}
+		row := byTag[in.Tag]
+		if row == nil {
+			row = &model.Inbound{ServerID: serverID, Tag: in.Tag}
+			if err := tx.Create(row).Error; err != nil {
+				return err
+			}
+			byTag[in.Tag] = row
+		}
+		if err := rememberInboundTrafficTag(tx, row); err != nil {
+			return err
+		}
+		if err := tx.Model(row).Updates(map[string]any{
+			"type":        model.InboundType(in.Type),
+			"listen_port": in.ListenPort,
+			"enabled":     true,
+			"settings":    model.JSONText(settings),
+			"remark":      "同步自服务器配置",
+		}).Error; err != nil {
+			return err
+		}
+		keepIDs = append(keepIDs, row.ID)
+	}
+	keep := make(map[uint]bool, len(keepIDs))
+	for _, id := range keepIDs {
+		keep[id] = true
+	}
+	removedIDs := make([]uint, 0, len(existing))
+	for _, row := range existing {
+		if !keep[row.ID] {
+			removedIDs = append(removedIDs, row.ID)
+		}
+	}
+	if err := deleteUserNodeOrderRefs(tx, userNodeTypeManaged, removedIDs); err != nil {
+		return err
+	}
+	if err := deleteRowsExcept(tx, serverID, keepIDs, &model.Inbound{}); err != nil {
+		return err
+	}
+	for _, inboundID := range removedIDs {
+		if err := removeInboundUserAssignments(tx, inboundID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncImportedOutbounds(tx *gorm.DB, serverID uint, parsed []singbox.ParsedOutbound) error {
+	var existing []model.Outbound
+	if err := tx.Where("server_id = ?", serverID).Find(&existing).Error; err != nil {
+		return err
+	}
+	byTag := make(map[string]*model.Outbound, len(existing))
+	for i := range existing {
+		byTag[existing[i].Tag] = &existing[i]
+	}
+	keepIDs := make([]uint, 0, len(parsed))
+	for i, ob := range parsed {
+		blob, err := json.Marshal(map[string]any{
+			"server": ob.Server, "server_port": ob.ServerPort,
+			"username": ob.Username, "uuid": ob.UUID, "password": ob.Password,
+			"settings": ob.Settings,
+		})
+		if err != nil {
+			return err
+		}
+		row := byTag[ob.Tag]
+		if row == nil {
+			row = &model.Outbound{ServerID: serverID, Tag: ob.Tag}
+			if err := tx.Create(row).Error; err != nil {
+				return err
+			}
+			byTag[ob.Tag] = row
+		}
+		if err := tx.Model(row).Updates(map[string]any{
+			"type": ob.Type, "settings": model.JSONText(blob), "sort": i,
+			"remark": "同步自服务器配置",
+		}).Error; err != nil {
+			return err
+		}
+		keepIDs = append(keepIDs, row.ID)
+	}
+	return deleteRowsExcept(tx, serverID, keepIDs, &model.Outbound{})
+}
+
+func replaceImportedRules(tx *gorm.DB, serverID uint, parsed []singbox.ParsedRule) error {
+	if err := tx.Where("server_id = ?", serverID).Delete(&model.RouteRule{}).Error; err != nil {
+		return err
+	}
+	for i, rule := range parsed {
+		match, err := json.Marshal(rule.Match)
+		if err != nil {
+			return err
+		}
+		row := &model.RouteRule{
+			ServerID: serverID, Sort: i, Match: model.JSONText(match),
+			Outbound: rule.Outbound, Enabled: true, Remark: "同步自服务器配置",
+		}
+		if err := tx.Create(row).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncImportedRuleSets(tx *gorm.DB, serverID uint, parsed []singbox.RuleSetInput) error {
+	var existing []model.RuleSet
+	if err := tx.Where("server_id = ?", serverID).Find(&existing).Error; err != nil {
+		return err
+	}
+	byTag := make(map[string]*model.RuleSet, len(existing))
+	for i := range existing {
+		byTag[existing[i].Tag] = &existing[i]
+	}
+	keepIDs := make([]uint, 0, len(parsed))
+	for _, rs := range parsed {
+		format := rs.Format
+		if format != "source" {
+			format = "binary"
+		}
+		typ := rs.Type
+		if typ != "local" {
+			typ = "remote"
+		}
+		row := byTag[rs.Tag]
+		if row == nil {
+			row = &model.RuleSet{ServerID: serverID, Tag: rs.Tag}
+			if err := tx.Create(row).Error; err != nil {
+				return err
+			}
+			byTag[rs.Tag] = row
+		}
+		if err := tx.Model(row).Updates(map[string]any{
+			"type": typ, "format": format, "url": rs.URL, "path": rs.Path,
+			"download_detour": rs.DownloadDetour, "update_interval": rs.UpdateInterval,
+		}).Error; err != nil {
+			return err
+		}
+		keepIDs = append(keepIDs, row.ID)
+	}
+	return deleteRowsExcept(tx, serverID, keepIDs, &model.RuleSet{})
+}

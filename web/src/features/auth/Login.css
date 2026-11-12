@@ -1,0 +1,76 @@
+.login-page {
+  display: flex;
+  min-height: 100vh;
+  min-height: calc(100 * var(--dvh));
+  align-items: center;
+  justify-content: center;
+  padding: 32px 20px;
+  background: var(--console-surface);
+  color: var(--console-ink);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  padding: 32px 28px 28px;
+  border: 1px solid var(--console-border);
+  border-radius: var(--app-radius, 12px);
+  background: var(--console-container);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 4%), 0 12px 32px -16px rgb(0 0 0 / 12%);
+}
+
+.login-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 28px;
+  text-align: center;
+}
+
+.login-logo {
+  display: block;
+  width: 52px;
+  height: 52px;
+}
+
+.login-head h1 {
+  margin: 0;
+  color: var(--console-ink);
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.3px;
+}
+
+.login-card .ui-form-item {
+  margin-bottom: 18px;
+}
+
+.login-card .ui-input-lg,
+.login-card .ui-input-affix-wrapper-lg {
+  font-size: 14px;
+}
+
+.login-card .login-submit {
+  margin-top: 8px;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+@media (max-width: 767px) {
+  .login-page {
+    align-items: flex-start;
+    padding: 72px 16px 24px;
+  }
+
+  .login-card {
+    padding: 28px 20px 22px;
+  }
+
+  .login-card .ui-input-lg,
+  .login-card .ui-input-affix-wrapper-lg,
+  .login-card .ui-input-affix-wrapper-lg > input.ui-input {
+    font-size: 16px;
+  }
+}

@@ -1,0 +1,86 @@
+/* Initial values match theme.ts; Appearance applies the selected palette. */
+:root {
+  color-scheme: light;
+  --console-ink: #111111;
+  --console-muted: #666666;
+  --console-faint: #8f8f8f;
+  --console-placeholder: #a3a3a3;
+  --console-border: #eaeaea;
+  --console-border-strong: #d6d6d6;
+  --console-border-hover: #b5b5b5;
+  --console-layout: #ffffff;
+  --console-container: #ffffff;
+  --console-elevated: #ffffff;
+  --console-surface: #fafafa;
+  --console-chrome: #ffffff;
+  --console-chrome-tint: #fafafa;
+  --console-spotlight: #111111;
+  --console-selected: #f2f2f2;
+  --console-selected-border: #e6e6e6;
+  --console-selected-text: #111111;
+  --console-primary: #111111;
+  --console-on-primary: #ffffff;
+  --console-brand: #111111;
+  --console-link: #0b63ce;
+  --console-hover: #f4f4f4;
+  --console-focus: #0b63ce;
+  --console-success: #16a34a;
+  --console-warning: #d97706;
+  --console-error: #dc2626;
+  --console-warning-text: #a35a00;
+  --console-error-text: #b91c1c;
+  --console-download: #111111;
+  --console-upload: #9a9a9a;
+  --console-shadow: 0 0 0;
+}
+
+:root[data-console-theme='dark'] {
+  color-scheme: dark;
+}
+
+:root[data-console-theme] body {
+  background: var(--console-layout);
+}
+
+.console-app {
+  color: var(--console-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+.console-app .ui-card {
+  box-shadow: 0 3px 14px rgb(var(--console-shadow) / 3%);
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+
+.console-app .ui-btn {
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+.console-app .ui-btn:not(:disabled):active {
+  transform: translateY(1px);
+}
+
+:root[data-console-theme='blue'] .console-app {
+  -webkit-font-smoothing: auto;
+}
+
+:root[data-console-theme='blue'] .console-app .ui-card {
+  box-shadow: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .console-app .ui-card:hover {
+    border-color: var(--console-border-hover);
+    box-shadow: 0 6px 24px rgb(var(--console-shadow) / 5%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .console-app *,
+  .console-app *::before,
+  .console-app *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

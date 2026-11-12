@@ -1,0 +1,563 @@
+// Package model holds the persisted entities (GORM) shared across the panel.
+package model
+
+import (
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// JSONText is a JSON-valued DB column stored as text, usable as json.RawMessage.
+type JSONText []byte
+
+// Value implements driver.Valuer.
+func (j JSONText) Value() (driver.Value, error) {
+	if len(j) == 0 {
+		return "null", nil
+	}
+	return string(j), nil
+}
+
+// Scan implements sql.Scanner.
+func (j *JSONText) Scan(src any) error {
+	if src == nil {
+		*j = nil
+		return nil
+	}
+	switch v := src.(type) {
+	case []byte:
+		*j = append((*j)[:0], v...)
+	case string:
+		*j = append((*j)[:0], v...)
+	default:
+		return errors.New("model.JSONText: unsupported Scan source")
+	}
+	return nil
+}
+
+// MarshalJSON returns the raw JSON.
+func (j JSONText) MarshalJSON() ([]byte, error) {
+	if len(j) == 0 {
+		return []byte("null"), nil
+	}
+	return j, nil
+}
+
+// UnmarshalJSON stores the raw JSON.
+func (j *JSONText) UnmarshalJSON(data []byte) error {
+	if j == nil {
+		return errors.New("model.JSONText: UnmarshalJSON on nil pointer")
+	}
+	*j = append((*j)[:0], data...)
+	return nil
+}
+
+// Role is a panel account role.
+type Role string
+
+const (
+	RoleAdmin Role = "admin"
+	RoleUser  Role = "user"
+)
+
+// User is a panel account. On a multi-user-capable inbound its ProxyToken also
+// seeds a stable, per-inbound proxy identity; single-credential inbounds still
+// use the credential stored in their own settings.
+type User struct {
+	ID              uint    `gorm:"primaryKey" json:"id"`
+	Email           string  `gorm:"uniqueIndex;size:191" json:"email"`
+	EmailNormalized *string `gorm:"uniqueIndex;size:191" json:"-"`
+	Password        string  `json:"-"` // bcrypt hash
+	Role            Role    `gorm:"size:16;index" json:"role"`
+
+	// ServerIDs are the nodes this user is provisioned on and can subscribe to.
+	ServerIDs []uint `gorm:"serializer:json" json:"server_ids"`
+
+	// InboundIDs narrows access to specific protocols within those nodes — e.g.
+	// a home-broadband inbound kept for personal use only. Empty means every
+	// inbound on the selected servers (the previous, server-level behaviour).
+	InboundIDs []uint `gorm:"serializer:json" json:"inbound_ids"`
+
+	ExpireAt *time.Time `json:"expire_at"` // nil = never
+
+	Enabled bool `gorm:"index" json:"enabled"`
+	// SubToken is the bearer token in the user's subscription URL. It is never
+	// serialized to API responses: the frontend only needs the assembled
+	// subscription_url, and a leaked token would keep working even after the
+	// account is disabled or the URL is reset from another device. The reset
+	// endpoint returns the new token explicitly instead.
+	SubToken string `gorm:"uniqueIndex;size:64" json:"-"`
+	// ProxyToken independently seeds deterministic per-inbound credentials.
+	// Resetting a subscription rotates this seed too; changing a login password
+	// leaves proxy credentials unchanged.
+	ProxyToken string `gorm:"size:64" json:"-"`
+	// TokenVersion revokes every previously-issued JWT when it changes. Password
+	// changes, account disabling and other security-sensitive updates increment it.
+	TokenVersion uint `json:"-"`
+
+	// Usage tracking from panel logins and subscription fetches. Per-user
+	// bytes live in TrafficUserHourly (multi-user inbounds on sing-box 1.14+)
+	// and are deliberately not fields here, so /api/user/me never exposes them.
+	LastLoginAt   *time.Time `json:"last_login_at"`
+	LastLoginIP   string     `gorm:"size:64" json:"last_login_ip"`
+	LastSubAt     *time.Time `json:"last_sub_at"`
+	LastSubIP     string     `gorm:"size:64" json:"last_sub_ip"`
+	LastSubClient string     `gorm:"size:32" json:"last_sub_client"`
+	LastSubUA     string     `gorm:"size:255" json:"last_sub_ua"`
+	SubFetchCount int64      `gorm:"not null;default:0" json:"sub_fetch_count"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// UserNodeOrder stores one user's mixed subscription order and optional
+// per-user display name overrides. NodeType is "managed" for a panel inbound
+// and "custom" for an external node. The assignment itself remains in
+// User/CustomNode; this table controls the order and custom name emitted for
+// that user.
+type UserNodeOrder struct {
+	ID         uint      `gorm:"primaryKey" json:"id"`
+	UserID     uint      `gorm:"not null;index;uniqueIndex:idx_user_node_order,priority:1" json:"user_id"`
+	NodeType   string    `gorm:"size:16;not null;uniqueIndex:idx_user_node_order,priority:2" json:"node_type"`
+	NodeID     uint      `gorm:"not null;uniqueIndex:idx_user_node_order,priority:3" json:"node_id"`
+	SortOrder  int       `gorm:"not null;index" json:"sort_order"`
+	CustomName string    `gorm:"size:128" json:"custom_name,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+const (
+	ConfigModeManaged = "managed"
+	ConfigModeRaw     = "raw"
+)
+
+// Server is one VPS, i.e. one Agent.
+type Server struct {
+	ID   uint   `gorm:"primaryKey" json:"id"`
+	Name string `gorm:"size:64" json:"name"`
+
+	// Stable connection credential used by the Agent for WebSocket and artifact
+	// authentication.
+	AgentToken string `gorm:"uniqueIndex;size:64" json:"-"`
+
+	// Public host used in share/subscription links (domain or IP the clients dial).
+	Address string `gorm:"size:191" json:"address"`
+	Remark  string `gorm:"size:255" json:"remark"`
+	Region  string `gorm:"size:64" json:"region"`
+
+	// Reported by the agent.
+	Online               bool       `gorm:"index" json:"online"`
+	LastSeen             *time.Time `json:"last_seen"`
+	Hostname             string     `gorm:"size:191" json:"hostname"`
+	OS                   string     `gorm:"size:64" json:"os"`
+	Arch                 string     `gorm:"size:32" json:"arch"`
+	Kernel               string     `gorm:"size:64" json:"kernel"`
+	PublicIP             string     `gorm:"size:64" json:"public_ip"`
+	AgentVersion         string     `gorm:"size:64" json:"agent_version"`
+	AgentHasUpdate       bool       `gorm:"-" json:"agent_has_update,omitempty"`
+	AgentLatestVersion   string     `gorm:"-" json:"agent_latest_version,omitempty"`
+	SingboxInstalled     bool       `json:"singbox_installed"`
+	SingboxVersion       string     `gorm:"size:32" json:"singbox_version"`
+	SingboxActive        bool       `json:"singbox_active"`
+	SingboxHasUpdate     bool       `gorm:"-" json:"singbox_has_update,omitempty"`
+	SingboxLatestVersion string     `gorm:"-" json:"singbox_latest_version,omitempty"`
+	Uptime               int64      `json:"uptime"`
+	Load1                float64    `json:"load1"`
+	MemUsed              uint64     `json:"mem_used"`
+	MemTotal             uint64     `json:"mem_total"`
+
+	// Traffic counters are accumulated from the Agent's loopback Clash API.
+	TrafficAvailable      bool       `gorm:"index" json:"traffic_available"`
+	TrafficUpload         uint64     `json:"traffic_upload"`
+	TrafficDownload       uint64     `json:"traffic_download"`
+	TrafficUploadRate     uint64     `json:"traffic_upload_rate"`
+	TrafficDownloadRate   uint64     `json:"traffic_download_rate"`
+	TrafficTCPConnections int        `json:"traffic_tcp_connections"`
+	TrafficUDPConnections int        `json:"traffic_udp_connections"`
+	TrafficUpdatedAt      *time.Time `json:"traffic_updated_at"`
+	TrafficRemoteUpload   uint64     `json:"-"`
+	TrafficRemoteDownload uint64     `json:"-"`
+	// TrafficQuota is a retained, unused provider-quota column. The panel
+	// measures sing-box traffic, not the host's provider meter.
+	TrafficQuota uint64 `gorm:"not null;default:0" json:"-"`
+	// TrafficResetDay starts each monthly statistics cycle at 00:00 UTC.
+	// Days absent from a month are clamped to that month's final day.
+	TrafficResetDay int `gorm:"not null;default:1" json:"traffic_reset_day"`
+
+	// FinalOutbound is the default route target (default "direct").
+	FinalOutbound string `gorm:"size:64" json:"final_outbound"`
+
+	// ConfigMode selects the source of truth for the node configuration. Managed
+	// mode renders the structured inbound/outbound/routing tables; raw mode keeps
+	// and re-applies the administrator's complete JSON without dropping fields the
+	// panel does not understand.
+	ConfigMode string   `gorm:"size:16;default:managed" json:"config_mode"`
+	RawConfig  JSONText `gorm:"type:text" json:"-"`
+	// ConfigInitialized distinguishes a brand-new node (whose existing
+	// sing-box config must not be touched) from a deliberately empty managed
+	// config after the administrator deletes the last structured record.
+	ConfigInitialized bool `gorm:"default:false" json:"-"`
+
+	// A subscription reset queues a durable credential revision in the same
+	// transaction as the new seeds. Only an Agent acknowledgement can settle it.
+	ProxySyncRevision        uint64 `gorm:"not null;default:0" json:"-"`
+	ProxySyncAppliedRevision uint64 `gorm:"not null;default:0" json:"-"`
+	ProxySyncFailed          bool   `gorm:"not null;default:false" json:"-"`
+
+	// AgentURL is the endpoint reported by the running Agent. It makes migrations
+	// from an IP address to the panel domain visible and verifiable in the UI.
+	AgentURL string `gorm:"size:512" json:"agent_url"`
+
+	Inbounds []Inbound `gorm:"constraint:OnDelete:CASCADE" json:"inbounds,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// EffectiveConfigMode treats rows created before ConfigMode existed as managed.
+func (s *Server) EffectiveConfigMode() string {
+	if s.ConfigMode == ConfigModeRaw && len(s.RawConfig) > 0 {
+		return ConfigModeRaw
+	}
+	return ConfigModeManaged
+}
+
+// InboundType is a supported server-side protocol.
+type InboundType string
+
+const (
+	InboundVLESS       InboundType = "vless"
+	InboundVMess       InboundType = "vmess"
+	InboundTrojan      InboundType = "trojan"
+	InboundShadowsocks InboundType = "shadowsocks"
+	InboundHysteria2   InboundType = "hysteria2"
+	InboundTUIC        InboundType = "tuic"
+	InboundNaive       InboundType = "naive"
+	InboundHysteria    InboundType = "hysteria" // v1
+	InboundSocks       InboundType = "socks"
+	InboundShadowTLS   InboundType = "shadowtls"
+	InboundAnyTLS      InboundType = "anytls"
+	InboundSnell       InboundType = "snell"
+)
+
+// Inbound is a protocol listener on a Server. Protocol/transport/tls specifics
+// live in Settings as JSON, validated against internal/domain/singbox.InboundSettings.
+type Inbound struct {
+	ID         uint        `gorm:"primaryKey" json:"id"`
+	ServerID   uint        `gorm:"index" json:"server_id"`
+	Tag        string      `gorm:"size:64" json:"tag"`
+	Type       InboundType `gorm:"size:32" json:"type"`
+	ListenPort int         `json:"listen_port"`
+	Enabled    bool        `gorm:"index" json:"enabled"`
+	Settings   JSONText    `gorm:"type:text" json:"settings"`
+	Remark     string      `gorm:"size:255" json:"remark"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Outbounds imported from another node of the panel keep a reference to their
+// source instead of a frozen credential copy: the referenced inbound issues a
+// dedicated credential (see sourceOutboundClient), so it keeps working when the
+// source's settings change and disappears when the source is removed.
+const (
+	OutboundSourceInbound    = "inbound"     // a panel-managed inbound (own or another server)
+	OutboundSourceCustomNode = "custom_node" // an external/custom node
+)
+
+// Outbound is a routing target on a Server: "direct" or a proxy to a landing
+// server. Settings holds proxy-specific fields as JSON.
+type Outbound struct {
+	ID       uint     `gorm:"primaryKey" json:"id"`
+	ServerID uint     `gorm:"index" json:"server_id"`
+	Tag      string   `gorm:"size:64" json:"tag"`
+	Type     string   `gorm:"size:32" json:"type"` // direct | vless | vmess | trojan | shadowsocks | hysteria2 | tuic
+	Settings JSONText `gorm:"type:text" json:"settings"`
+	// SourceKind/SourceID are set for outbounds imported from a panel node.
+	// Manual entries and URI imports leave both empty and carry their own
+	// credential in Settings; URI imports are independent snapshots.
+	SourceKind string    `gorm:"size:16" json:"source_kind,omitempty"`
+	SourceID   uint      `gorm:"index" json:"source_id,omitempty"`
+	Remark     string    `gorm:"size:255" json:"remark"`
+	Sort       int       `json:"sort"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// Referenced reports whether this outbound follows a panel node rather than
+// storing an independent copy of its connection parameters.
+func (o *Outbound) Referenced() bool {
+	return (o.SourceKind == OutboundSourceInbound || o.SourceKind == OutboundSourceCustomNode) && o.SourceID != 0
+}
+
+// RouteRule is one routing rule on a Server: match conditions -> outbound tag
+// (or "block"). Match holds the match fields as JSON.
+type RouteRule struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	ServerID  uint      `gorm:"index" json:"server_id"`
+	Sort      int       `json:"sort"`
+	Match     JSONText  `gorm:"type:text" json:"match"`
+	Outbound  string    `gorm:"size:64" json:"outbound"`
+	Remark    string    `gorm:"size:255" json:"remark"`
+	Enabled   bool      `gorm:"index" json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// RuleSet is a remote or local rule-set definition on a Server (for geoip/geosite-style
+// matching referenced by route rules).
+type RuleSet struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	ServerID       uint      `gorm:"index;uniqueIndex:idx_node_tag" json:"server_id"`
+	Tag            string    `gorm:"size:64;not null;uniqueIndex:idx_node_tag" json:"tag"`
+	Type           string    `gorm:"size:16;not null;default:remote" json:"type"`   // remote | local
+	Format         string    `gorm:"size:16;not null;default:binary" json:"format"` // binary | source
+	URL            string    `gorm:"size:512" json:"url"`
+	Path           string    `gorm:"size:512" json:"path"`
+	DownloadDetour string    `gorm:"size:64" json:"download_detour"`
+	UpdateInterval string    `gorm:"size:32" json:"update_interval"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// Setting is a KV configuration row.
+type Setting struct {
+	Key   string `gorm:"primaryKey;size:64" json:"key"`
+	Value string `json:"value"`
+}
+
+// TrafficRecord is one one-minute accounting bucket. InboundID=0 stores the
+// node total; non-zero rows are attributed to a sing-box inbound port.
+type TrafficRecord struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	ServerID       uint      `gorm:"not null;uniqueIndex:idx_traffic_bucket,priority:1;index" json:"server_id"`
+	InboundID      uint      `gorm:"not null;default:0;uniqueIndex:idx_traffic_bucket,priority:2;index" json:"inbound_id"`
+	Bucket         time.Time `gorm:"not null;uniqueIndex:idx_traffic_bucket,priority:3;index" json:"bucket"`
+	Upload         uint64    `gorm:"not null;default:0" json:"upload"`
+	Download       uint64    `gorm:"not null;default:0" json:"download"`
+	UploadRate     uint64    `gorm:"not null;default:0" json:"upload_rate"`
+	DownloadRate   uint64    `gorm:"not null;default:0" json:"download_rate"`
+	TCPConnections int       `gorm:"not null;default:0" json:"tcp_connections"`
+	UDPConnections int       `gorm:"not null;default:0" json:"udp_connections"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// TrafficHourly is the long-retention hourly rollup of TrafficRecord. It is
+// written alongside the minute buckets so long ranges never scan minute rows.
+// TCP/UDP connection columns hold the hour's maximum.
+type TrafficHourly struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	ServerID       uint      `gorm:"not null;uniqueIndex:idx_traffic_hourly_key,priority:1;index" json:"server_id"`
+	InboundID      uint      `gorm:"not null;default:0;uniqueIndex:idx_traffic_hourly_key,priority:2" json:"inbound_id"`
+	Bucket         time.Time `gorm:"not null;uniqueIndex:idx_traffic_hourly_key,priority:3;index" json:"bucket"`
+	Upload         uint64    `gorm:"not null;default:0" json:"upload"`
+	Download       uint64    `gorm:"not null;default:0" json:"download"`
+	UploadRate     uint64    `gorm:"not null;default:0" json:"upload_rate"`
+	DownloadRate   uint64    `gorm:"not null;default:0" json:"download_rate"`
+	TCPConnections int       `gorm:"not null;default:0" json:"tcp_connections"`
+	UDPConnections int       `gorm:"not null;default:0" json:"udp_connections"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// TableName keeps the hourly table name stable.
+func (TrafficHourly) TableName() string { return "traffic_hourly" }
+
+// TrafficUserHourly is one hour of one panel user's traffic on one multi-user
+// inbound, attributed from the sing-box API service connection stream. It is
+// visible to administrators only; nothing here is exposed on the User model.
+type TrafficUserHourly struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	ServerID  uint      `gorm:"not null;uniqueIndex:idx_traffic_user_hourly_key,priority:1;index" json:"server_id"`
+	InboundID uint      `gorm:"not null;uniqueIndex:idx_traffic_user_hourly_key,priority:2" json:"inbound_id"`
+	UserID    uint      `gorm:"not null;uniqueIndex:idx_traffic_user_hourly_key,priority:3;index:idx_traffic_user_hourly_user,priority:1" json:"user_id"`
+	Bucket    time.Time `gorm:"not null;uniqueIndex:idx_traffic_user_hourly_key,priority:4;index:idx_traffic_user_hourly_user,priority:2;index" json:"bucket"`
+	Upload    uint64    `gorm:"not null;default:0" json:"upload"`
+	Download  uint64    `gorm:"not null;default:0" json:"download"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName keeps the per-user hourly table name stable.
+func (TrafficUserHourly) TableName() string { return "traffic_user_hourly" }
+
+// SubscriptionFetch is one subscription download, kept for a limited window
+// so administrators can see which clients and addresses use an account.
+type SubscriptionFetch struct {
+	ID        uint      `gorm:"primaryKey;index:idx_sub_fetch_user_ip_time,priority:4" json:"id"`
+	UserID    uint      `gorm:"not null;index:idx_sub_fetch_user_time,priority:1;index:idx_sub_fetch_user_ip_time,priority:1" json:"user_id"`
+	IP        string    `gorm:"size:64;index:idx_sub_fetch_user_ip_time,priority:2" json:"ip"`
+	Client    string    `gorm:"size:32" json:"client"`
+	Format    string    `gorm:"size:16" json:"format"`
+	UserAgent string    `gorm:"size:255" json:"user_agent"`
+	Status    int       `json:"status"`
+	CreatedAt time.Time `gorm:"index;index:idx_sub_fetch_user_time,priority:2;index:idx_sub_fetch_user_ip_time,priority:3" json:"created_at"`
+}
+
+// SchemaMigration records one successfully-applied database schema change.
+// It deliberately lives outside AllModels: the migration runner bootstraps
+// this table before it applies any application schema.
+type SchemaMigration struct {
+	Version   uint      `gorm:"primaryKey" json:"version"`
+	Name      string    `gorm:"size:191;not null" json:"name"`
+	Dirty     bool      `gorm:"not null;default:false" json:"dirty"`
+	AppliedAt time.Time `gorm:"not null" json:"applied_at"`
+}
+
+// NameRewriteRule is one ordered processing rule for nodes managed by a saved
+// remote subscription. Actions include rename, protocol exclusion, and node
+// inclusion/exclusion. An empty Action and replace_text remain legacy aliases
+// for rename so older databases continue to work.
+type NameRewriteRule struct {
+	Action      string `json:"action,omitempty"`
+	Pattern     string `json:"pattern"`
+	Replacement string `json:"replacement"`
+	MatchMode   string `json:"match_mode,omitempty"`
+}
+
+// CustomNode is a hand-added external node that is merged into a user's
+// subscription. It is defined either by a standard share link (vless://,
+// vmess://, ss://, trojan://, hysteria2://, tuic://, anytls://, socks5://) or
+// by structured fields for protocols without a widely-supported share-link
+// scheme (snell, mixed). Every subscription format (links/sing-box/clash/
+// surge) is derived from one of those two representations. The node is never
+// part of the managed sing-box configuration — the panel cannot provision
+// credentials on a server it does not control, so the link/params carry the
+// complete client credentials. AllUsers keeps the default-for-future-users
+// behaviour explicit; ExcludedUserIDs records per-user exceptions without
+// collapsing that default into a snapshot of the current account list.
+type CustomNode struct {
+	ID              uint   `gorm:"primaryKey" json:"id"`
+	AllUsers        bool   `gorm:"not null;default:false" json:"all_users"`
+	UserIDs         []uint `gorm:"serializer:json" json:"user_ids"`
+	ExcludedUserIDs []uint `gorm:"serializer:json" json:"excluded_user_ids"`
+	Name            string `gorm:"size:128" json:"name"`
+	// SourceName is the name returned by the remote subscription before local
+	// name-rewrite rules are applied. Manual nodes leave it empty.
+	SourceName string   `gorm:"size:1024" json:"source_name,omitempty"`
+	Group      string   `gorm:"size:64;index" json:"group"` // optional admin grouping (e.g. airport name)
+	Link       string   `gorm:"size:1024" json:"link"`      // share link (optional)
+	Protocol   string   `gorm:"size:32" json:"protocol"`    // structured node protocol, e.g. snell
+	Address    string   `gorm:"size:255" json:"address"`    // structured node host
+	Port       int      `json:"port"`
+	Params     JSONText `gorm:"type:text" json:"params"` // protocol-specific JSON (psk, version, obfs...)
+	Enabled    bool     `gorm:"index" json:"enabled"`
+	// UserEnabled retains a managed node's own switch when its source is disabled.
+	UserEnabled bool `gorm:"not null;default:true" json:"-"`
+	SortOrder   int  `json:"sort_order"`
+	// HiddenBySubscriptionRule keeps a filtered subscription node in storage so
+	// removing the filter restores its stable row and per-user assignments.
+	// Manual nodes never set this field.
+	HiddenBySubscriptionRule bool `gorm:"index;not null;default:false" json:"-"`
+	// SubscriptionID/SubscriptionKey are set only for nodes managed by a saved
+	// remote subscription. Manual nodes keep both fields empty. The key is stable
+	// within one subscription and lets refreshes update rows without losing their
+	// per-user audience assignments.
+	SubscriptionID  *uint     `gorm:"index;uniqueIndex:idx_custom_node_subscription_key" json:"subscription_id,omitempty"`
+	SubscriptionKey string    `gorm:"size:64;uniqueIndex:idx_custom_node_subscription_key" json:"-"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+// SubscriptionSyncStatus records whether the last refresh applied all, some,
+// or none of the subscription snapshot.
+type SubscriptionSyncStatus string
+
+const (
+	SubscriptionSyncSuccess SubscriptionSyncStatus = "success"
+	SubscriptionSyncPartial SubscriptionSyncStatus = "partial"
+	SubscriptionSyncFailed  SubscriptionSyncStatus = "failed"
+)
+
+// CustomNodeSubscription is a saved HTTP(S) subscription whose generated
+// CustomNode rows are reconciled on a schedule. Failed refreshes only update
+// the status fields; they never remove the last known-good node set.
+type CustomNodeSubscription struct {
+	ID                    uint                   `gorm:"primaryKey" json:"id"`
+	Name                  string                 `gorm:"size:128;not null" json:"name"`
+	URL                   string                 `gorm:"size:2048;not null" json:"url"`
+	Group                 string                 `gorm:"size:64;index" json:"group"`
+	Enabled               bool                   `gorm:"index;not null;default:true" json:"enabled"`
+	AutoUpdate            bool                   `gorm:"index;not null;default:true" json:"auto_update"`
+	UpdateIntervalMinutes int                    `gorm:"not null;default:60" json:"update_interval_minutes"`
+	BaseSortOrder         int                    `json:"base_sort_order"`
+	NameRewriteRules      []NameRewriteRule      `gorm:"serializer:json;type:text" json:"name_rewrite_rules"`
+	LastSyncAt            *time.Time             `json:"last_sync_at"`
+	LastSuccessAt         *time.Time             `json:"last_success_at"`
+	LastSyncStatus        SubscriptionSyncStatus `gorm:"size:16;not null;default:''" json:"last_sync_status"`
+	LastError             string                 `gorm:"type:text" json:"last_error"`
+	SourceType            string                 `gorm:"size:32" json:"source_type"`
+	NodeCount             int                    `json:"node_count"`
+	CreatedAt             time.Time              `json:"created_at"`
+	UpdatedAt             time.Time              `json:"updated_at"`
+}
+
+// AllModels lists every entity for AutoMigrate.
+func AllModels() []any {
+	return []any{
+		&User{}, &UserNodeOrder{}, &Server{}, &Inbound{}, &Outbound{}, &RouteRule{}, &RuleSet{}, &Setting{}, &TrafficRecord{},
+		&CustomNodeSubscription{}, &CustomNode{}, &TrafficHourly{}, &SubscriptionFetch{}, &TrafficUserHourly{}, &UserTrafficIdentity{}, &TrafficReportCursor{}, &InboundTrafficIdentity{},
+	}
+}
+
+// HasServer reports whether the user is provisioned on the given server.
+func (u *User) HasServer(id uint) bool {
+	for _, sid := range u.ServerIDs {
+		if sid == id {
+			return true
+		}
+	}
+	return false
+}
+
+// HasInbound reports whether the user may use one specific inbound. The user
+// must hold the server, and — when a per-inbound selection exists — that
+// inbound must be in it. An empty selection means all of the server's inbounds.
+func (u *User) HasInbound(serverID, inboundID uint) bool {
+	if !u.HasServer(serverID) {
+		return false
+	}
+	if len(u.InboundIDs) == 0 {
+		return true
+	}
+	for _, id := range u.InboundIDs {
+		if id == inboundID {
+			return true
+		}
+	}
+	return false
+}
+
+// HasUser reports whether a custom node is assigned to one account.
+func (n *CustomNode) HasUser(userID uint) bool {
+	ids := n.UserIDs
+	granted := false
+	if n.AllUsers {
+		ids = n.ExcludedUserIDs
+		granted = true
+	}
+	for _, id := range ids {
+		if id == userID {
+			return !n.AllUsers
+		}
+	}
+	return granted
+}
+
+// Expired reports whether the user's validity period has passed.
+//
+// Scope: expiry gates panel access and subscriptions. Managed multi-user
+// inbounds also remove expired users during reconciliation. A protocol kept in
+// single-credential mode cannot revoke one user without rotating its shared
+// credential. Per-user traffic is recorded for viewing only; there are no
+// traffic quotas.
+func (u *User) Expired(now time.Time) bool {
+	return u.ExpireAt != nil && now.After(*u.ExpireAt)
+}
+
+// String helpers for logging.
+func (s *Server) String() string {
+	return fmt.Sprintf("Server#%d(%s)", s.ID, s.Name)
+}

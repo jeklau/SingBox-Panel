@@ -1,0 +1,127 @@
+import { describe, expect, it } from 'vitest'
+
+import { buildOutboundBody } from './outboundForm'
+import type { Outbound } from './types'
+
+describe('buildOutboundBody', () => {
+  it('clears both copies of authentication from a URI-imported SOCKS outbound', () => {
+    const outbound = {
+      id: 1, server_id: 1, tag: 'socks', type: 'socks', remark: '', sort: 0,
+      settings: { server: 'node.example.com', server_port: 1080, username: 'alice', password: 'old',
+        settings: { username: 'alice', password: 'old' } },
+    } satisfies Outbound
+    const body = buildOutboundBody(outbound, {
+      type: 'socks', tag: 'socks', server: 'node.example.com', server_port: 1080, username: '', password: '',
+    })
+    expect(body.settings.username).toBe('')
+    expect(body.settings.password).toBe('')
+    expect(body.settings.settings?.username).toBeUndefined()
+    expect(body.settings.settings?.password).toBeUndefined()
+    expect(outbound.settings.settings.password).toBe('old')
+  })
+
+  it('replaces the PSK of an imported Snell outbound without retaining a hidden override', () => {
+    const outbound = {
+      id: 1, server_id: 1, tag: 'snell', type: 'snell', remark: '', sort: 0,
+      settings: { server: 'node.example.com', server_port: 443, password: 'old-psk',
+        settings: { snell_psk: 'old-psk', snell_version: 4, snell_reuse: true } },
+    } satisfies Outbound
+    const body = buildOutboundBody(outbound, {
+      type: 'snell', tag: 'snell', server: 'node.example.com', server_port: 443,
+      password: 'new-psk', snell_version: 4, snell_reuse: true,
+    })
+    expect(body.settings.password).toBe('new-psk')
+    expect(body.settings.settings?.snell_psk).toBeUndefined()
+    expect(body.settings.settings?.snell_reuse).toBe(true)
+    expect(outbound.settings.settings.snell_psk).toBe('old-psk')
+  })
+
+  it('preserves hidden imported parameters while editing visible fields', () => {
+    const outbound = {
+      id: 1,
+      server_id: 1,
+      tag: 'trojan-old',
+      type: 'trojan',
+      remark: '',
+      sort: 0,
+      settings: {
+        server: 'old.example.com',
+        server_port: 443,
+        password: 'secret',
+        settings: {
+          tls: {
+            enabled: true,
+            server_name: 'old.example.com',
+            fingerprint: 'firefox',
+            reality: { enabled: true, public_key: 'public-key', short_id: ['abcd'] },
+          },
+          transport: {
+            type: 'ws',
+            path: '/old',
+            headers: { Host: 'old.example.com', Origin: 'https://origin.example.com' },
+            max_early_data: 2048,
+            early_data_header: 'Sec-WebSocket-Protocol',
+          },
+        },
+      },
+    } satisfies Outbound
+
+    const body = buildOutboundBody(outbound, {
+      type: 'trojan', tag: 'trojan-new', server: 'new.example.com', server_port: 8443,
+      password: 'secret', tls: true, sni: 'sni.example.com', tls_alpn: 'h2', insecure: false,
+      transport_type: 'ws', ws_path: '/new', ws_host: 'cdn.example.com',
+    })
+
+    expect(body.settings.settings?.tls?.reality?.public_key).toBe('public-key')
+    expect(body.settings.settings?.tls?.fingerprint).toBe('firefox')
+    expect(body.settings.settings?.transport?.max_early_data).toBe(2048)
+    expect(body.settings.settings?.transport?.early_data_header).toBe('Sec-WebSocket-Protocol')
+    expect(body.settings.settings?.transport?.headers?.Origin).toBe('https://origin.example.com')
+    expect(body.settings.settings?.transport?.headers?.Host).toBe('cdn.example.com')
+  })
+
+
+  it('preserves a case-insensitive Host header when the compact form omits it', () => {
+    const outbound = {
+      id: 1, server_id: 1, tag: 'vmess', type: 'vmess', remark: '', sort: 0,
+      settings: {
+        server: 'old.example.com', server_port: 443,
+        settings: { transport: { type: 'ws', path: '/ws', headers: { host: 'cdn.example.com', Origin: 'https://origin.example.com' } } },
+      },
+    } satisfies Outbound
+
+    const body = buildOutboundBody(outbound, {
+      type: 'vmess', tag: 'vmess', server: 'new.example.com', server_port: 8443,
+      uuid: 'uuid', vmess_security: 'auto', vmess_alter_id: 0,
+      transport_type: 'ws', ws_path: '/ws',
+    })
+
+    expect(body.settings.settings?.transport?.headers?.host).toBe('cdn.example.com')
+    expect(body.settings.settings?.transport?.headers?.Origin).toBe('https://origin.example.com')
+  })
+
+  it('forces TLS for protocols that require it', () => {
+    const body = buildOutboundBody(null, {
+      type: 'anytls', tag: 'anytls', server: 'example.com', server_port: 443,
+      password: 'secret', tls: false, sni: 'example.com', insecure: false,
+    })
+    expect(body.settings.settings?.tls?.enabled).toBe(true)
+  })
+
+  it('drops old protocol fields when changing the outbound type', () => {
+    const outbound = {
+      id: 1, server_id: 1, tag: 'old', type: 'trojan', remark: '', sort: 0,
+      settings: {
+        server: 'old.example.com', server_port: 443, password: 'secret',
+        settings: { tls: { enabled: true, reality: { enabled: true, public_key: 'key' } } },
+      },
+    } satisfies Outbound
+    const body = buildOutboundBody(outbound, {
+      type: 'socks', tag: 'socks', server: 'proxy.example.com', server_port: 1080,
+      username: 'alice', password: 'pw',
+    })
+    expect(body.settings.settings?.tls).toBeUndefined()
+    expect(body.settings.uuid).toBeUndefined()
+    expect(body.settings.username).toBe('alice')
+  })
+})

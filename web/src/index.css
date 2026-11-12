@@ -1,0 +1,133 @@
+html,
+body,
+#root {
+  height: auto;
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+/* Keep the document as the only page scroller. overflow-x:hidden would also
+   turn overflow-y into auto and create a second scroller around sticky nav. */
+#root {
+  overflow-x: clip;
+}
+
+/* Apple-style spinner (12 fading spokes), used by the route-loading fallback. */
+.app-spinner {
+  position: relative;
+  width: 20px;
+  height: 20px;
+}
+
+.app-spinner.lg {
+  width: 28px;
+  height: 28px;
+}
+
+.app-spinner span {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 8%;
+  height: 30%;
+  margin-left: -4%;
+  border-radius: 40%;
+  background: currentColor;
+  transform-origin: center 167%;
+  animation: app-spinner-fade 1s linear infinite;
+}
+
+@keyframes app-spinner-fade {
+  0% { opacity: 1; }
+  100% { opacity: 0.25; }
+}
+
+/* External-node table controls and normalized flag rendering. */
+
+.custom-node-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.custom-node-name > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.virtual-list {
+  position: relative;
+  display: block;
+  gap: 0;
+}
+
+/* Long code / preformatted blocks scroll instead of overflowing the page. */
+pre {
+  overflow-x: auto;
+}
+
+.rule-drag-handle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: grab;
+  touch-action: none;
+}
+
+.rule-drag-handle:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+/* Shared request-state layout. */
+.request-state {
+  width: 100%;
+  padding: 12px 0;
+}
+
+.request-state-loading {
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--console-muted);
+}
+
+.request-state-stale {
+  margin-bottom: 16px;
+}
+
+.request-state-refreshing {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  color: var(--console-muted);
+  font-size: 13px;
+}
+
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}

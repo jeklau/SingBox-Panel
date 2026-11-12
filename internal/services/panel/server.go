@@ -1,0 +1,514 @@
+package panel
+
+import (
+	"context"
+	"log"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+
+	"github.com/hann0w0/singbox-panel/internal/config"
+)
+
+// App is the panel HTTP server and its dependencies.
+type App struct {
+	cfg                 config.PanelConfig
+	db                  *gorm.DB
+	hub                 *Hub
+	auth                *Auth
+	orch                *Orchestrator
+	host                *hostStats
+	engine              *gin.Engine
+	startedAt           time.Time
+	login               *loginGuard
+	customSubscriptions *customNodeSubscriptionManager
+	wsLimiter           *wsHandshakeLimiter
+	wsLimiterMu         sync.Mutex
+	version             string
+	commit              string
+	cfgPath             string
+
+	// selfUpdating serializes panel self-update requests so two admins cannot
+	// launch competing binary swaps at once.
+	selfUpdating sync.Mutex
+
+	// OneDrive device-code sessions are short-lived and never persisted. The
+	// refresh token is stored encrypted in the existing settings table.
+	oneDriveMu      sync.Mutex
+	oneDrivePending map[string]oneDriveDeviceSession
+	oneDriveSyncMu  sync.Mutex
+	// Settings updates are stored as one JSON value. Serialize read-modify-write
+	// operations so token rotation cannot overwrite sync metadata (or vice versa).
+	oneDriveSettingsMu sync.Mutex
+	oneDriveTokenMu    sync.Mutex
+
+	agentInstallMu    sync.Mutex
+	agentInstallCodes map[string]agentInstallCode
+	agentArtifactMu   sync.Mutex
+	agentArtifacts    map[string]agentArtifactChecksum
+	logSessionsMu     sync.Mutex
+	logSessions       map[uint]map[string]logSessionLease
+	logSessionLocks   keyedMutex[uint]
+	serverOperations  *keyedMutex[uint]
+	userAccessMu      sync.Mutex
+	ipLocationsOnce   sync.Once
+	ipLocations       *ipLocationService
+}
+
+// SetVersion records the running panel version (set from main via ldflags) so
+// the maintenance API can report it and compare against the latest release.
+func (a *App) SetVersion(v string) { a.version = v }
+
+// SetCommit records the source revision embedded at build time. Older or
+// locally modified builds without an exact SHA remain explicitly unknown.
+func (a *App) SetCommit(v string) { a.commit = normalizeCommitSHA(v) }
+
+// SetConfigPath records the panel.yaml path (from the --config flag) so the
+// restore flow can rewrite jwt_secret when importing a backup from another host.
+func (a *App) SetConfigPath(p string) { a.cfgPath = p }
+
+// NewApp wires the panel components and builds the router.
+func NewApp(cfg config.PanelConfig, db *gorm.DB) *App {
+	// Validate has already rejected malformed entries before NewApp runs.
+	if prefixes, err := cfg.TrustedProxyPrefixes(); err == nil && len(prefixes) > 0 {
+		configuredTrustedProxies = prefixes
+	}
+	hub := NewHub(db)
+	orch := NewOrchestrator(db, hub)
+	a := &App{
+		cfg:                 cfg,
+		db:                  db,
+		hub:                 hub,
+		auth:                NewAuth(cfg.JWTSecret, db),
+		orch:                orch,
+		host:                &hostStats{},
+		startedAt:           time.Now(),
+		login:               newLoginGuard(),
+		customSubscriptions: newCustomNodeSubscriptionManager(db),
+		wsLimiter:           newWSHandshakeLimiter(),
+		oneDrivePending:     make(map[string]oneDriveDeviceSession),
+		agentInstallCodes:   make(map[string]agentInstallCode),
+		agentArtifacts:      make(map[string]agentArtifactChecksum),
+		logSessions:         make(map[uint]map[string]logSessionLease),
+		serverOperations:    newKeyedMutex[uint](),
+	}
+	// The orchestrator resolves node-imported outbounds against the live panel
+	// state (source inbound, external node, or their removal).
+	orch.app = a
+	hub.AfterRegister = func(serverID uint) {
+		// onRegister runs in the Agent read pump. Every command that waits for a
+		// result must run asynchronously so that pump can receive the response.
+		go orch.PushConfigIfManaged(serverID)
+		go a.resumeLogStream(serverID)
+	}
+	hub.AfterStatsCapabilityChange = func(serverID uint) {
+		go orch.PushConfigIfManaged(serverID)
+	}
+	a.engine = a.routes()
+	return a
+}
+
+func (a *App) lockServerOperation(serverID uint) func() {
+	if a.serverOperations == nil {
+		return func() {}
+	}
+	return a.serverOperations.lock(serverID)
+}
+
+func (a *App) routes() *gin.Engine {
+	if os.Getenv("GIN_MODE") == "" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	r := gin.New()
+	r.Use(gin.Recovery(), requestIDMiddleware(), panelRequestLogger(a.cfg.Subscription.PathPrefix), securityHeadersMiddleware(a.cfg.BaseURL), corsMiddleware(a.cfg.BaseURL, a.cfg.Environment))
+
+	// Public endpoints.
+	r.GET("/api/agent/install.sh", a.handleAgentInstallScript)
+	r.POST("/api/agent/register", a.exchangeAgentInstallCode)
+	r.GET("/api/agent/download", a.handleAgentDownload)
+	r.GET("/api/agent/checksum", a.handleAgentChecksum)
+	r.GET("/api/agent/ws", a.handleAgentWS)
+	r.POST("/api/auth/login", a.handleLogin)
+	r.GET(a.cfg.Subscription.PathPrefix+"/:token", a.handleSubscription)
+	r.GET("/api/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+	r.GET("/api/ready", a.handleReady)
+
+	// Authenticated user endpoints.
+	user := r.Group("/api")
+	user.Use(a.auth.Middleware())
+	{
+		user.POST("/auth/logout", a.handleLogout)
+		user.GET("/user/me", a.handleMe)
+		user.GET("/user/nodes", a.handleUserNodes)
+		user.GET("/user/subscription-sync", a.handleSubscriptionSync)
+		user.POST("/user/reset-sub", a.handleResetSub)
+		user.POST("/user/change-password", a.handleChangePassword)
+	}
+
+	// Admin endpoints.
+	admin := r.Group("/api/admin")
+	admin.Use(a.auth.Middleware(), AdminOnly())
+	{
+		admin.GET("/overview", a.adminOverview)
+
+		admin.GET("/servers", a.listServers)
+		admin.POST("/servers", a.createServer)
+		admin.PUT("/servers/order", a.updateServerOrder)
+		admin.GET("/servers/:id", a.getServer)
+		admin.PUT("/servers/:id", a.updateServer)
+		admin.DELETE("/servers/:id", a.deleteServer)
+		admin.POST("/servers/:id/install-singbox", a.installSingbox)
+		admin.POST("/servers/:id/uninstall-singbox", a.uninstallSingbox)
+		admin.POST("/servers/:id/uninstall-agent", a.uninstallAgent)
+		admin.POST("/servers/:id/service", a.serviceAction)
+		admin.POST("/servers/:id/update-agent", a.updateAgent)
+		admin.POST("/servers/update-all-agents", a.updateAllAgents)
+		admin.GET("/servers/:id/status", a.serverStatus)
+		admin.GET("/servers/:id/traffic", a.serverTraffic)
+		admin.GET("/servers/:id/traffic/live", a.handleTrafficSSE)
+		admin.GET("/servers/:id/logs", a.serverLogs)
+		admin.POST("/servers/:id/stream-logs", a.streamLogs)
+		admin.GET("/servers/:id/remote-config", a.remoteConfig)
+		admin.POST("/servers/:id/apply-raw", a.applyRawConfig)
+		admin.POST("/servers/:id/import-config", a.importRemoteConfig)
+		admin.POST("/servers/:id/config-mode", a.setConfigMode)
+		admin.GET("/servers/:id/node-formats", a.serverNodeFormats)
+
+		admin.GET("/servers/:id/inbounds", a.listInbounds)
+		admin.POST("/servers/:id/inbounds", a.createInbound)
+		admin.PUT("/servers/:id/inbounds/:inboundID", a.updateInbound)
+		admin.DELETE("/servers/:id/inbounds/:inboundID", a.deleteInbound)
+
+		admin.GET("/servers/:id/outbound-sources", a.listOutboundSources)
+		admin.POST("/servers/:id/outbound-preview", a.previewOutboundImport)
+		admin.GET("/servers/:id/outbounds", a.listOutbounds)
+		admin.POST("/servers/:id/outbounds", a.createOutbound)
+		admin.PUT("/servers/:id/outbounds/:outboundID", a.updateOutbound)
+		admin.DELETE("/servers/:id/outbounds/:outboundID", a.deleteOutbound)
+		admin.POST("/servers/:id/outbounds/:outboundID/test", a.testOutbound)
+
+		admin.GET("/servers/:id/rules", a.listRules)
+		admin.PUT("/servers/:id/rules/reorder", a.reorderRules)
+		admin.POST("/servers/:id/rules", a.createRule)
+		admin.PUT("/servers/:id/rules/:ruleID", a.updateRule)
+		admin.DELETE("/servers/:id/rules/:ruleID", a.deleteRule)
+
+		admin.GET("/servers/:id/rulesets", a.listRuleSets)
+		admin.POST("/servers/:id/rulesets", a.createRuleSet)
+		admin.PUT("/servers/:id/rulesets/:rulesetID", a.updateRuleSet)
+		admin.DELETE("/servers/:id/rulesets/:rulesetID", a.deleteRuleSet)
+
+		admin.PUT("/servers/:id/final-outbound", a.setFinalOutbound)
+
+		admin.GET("/users", a.listUsers)
+		admin.POST("/users", a.createUser)
+		admin.GET("/users/:id", a.getUser)
+		admin.PUT("/users/:id", a.updateUser)
+		admin.GET("/users/:id/access", a.getUserAccess)
+		admin.GET("/users/:id/sub-fetches", a.listUserSubscriptionFetches)
+		admin.GET("/users/:id/sub-fetch-location", a.userSubscriptionIPLocation)
+		admin.GET("/users/:id/traffic", a.userTraffic)
+		admin.PUT("/users/:id/access", a.updateUserAccess)
+		admin.DELETE("/users/:id", a.deleteUser)
+
+		// Hand-added external nodes merged into subscriptions (not managed here).
+		admin.GET("/custom-nodes", a.listCustomNodes)
+		admin.POST("/custom-nodes", a.createCustomNode)
+		admin.PUT("/custom-nodes/:id", a.updateCustomNode)
+		admin.DELETE("/custom-nodes/:id", a.deleteCustomNode)
+		admin.POST("/custom-nodes/batch-delete", a.batchDeleteCustomNodes)
+		admin.POST("/custom-nodes/batch-group", a.batchSetCustomNodeGroup)
+		admin.GET("/custom-node-subscriptions", a.listCustomNodeSubscriptions)
+		admin.POST("/custom-node-subscriptions", a.createCustomNodeSubscription)
+		admin.PUT("/custom-node-subscriptions/:id", a.updateCustomNodeSubscription)
+		admin.DELETE("/custom-node-subscriptions/:id", a.deleteCustomNodeSubscription)
+		admin.POST("/custom-node-subscriptions/:id/sync", a.syncCustomNodeSubscription)
+
+		// Panel maintenance: report/update the panel's own version and export
+		// a full data backup (SQLite DB + jwt_secret) for migration.
+		admin.GET("/maintenance/info", a.maintenanceInfo)
+		admin.POST("/maintenance/update", a.selfUpdate)
+		admin.GET("/maintenance/releases", a.maintenanceReleases)
+		admin.GET("/maintenance/backup", a.downloadBackup)
+		admin.POST("/maintenance/restore", a.restoreBackup)
+		admin.GET("/maintenance/onedrive", a.oneDriveStatus)
+		admin.POST("/maintenance/onedrive/auth/start", a.startOneDriveAuth)
+		admin.POST("/maintenance/onedrive/auth/:sessionID/poll", a.pollOneDriveAuth)
+		admin.PUT("/maintenance/onedrive/passphrase", a.setOneDrivePassphrase)
+		admin.POST("/maintenance/onedrive/sync", a.syncOneDriveBackup)
+		admin.GET("/maintenance/onedrive/backups/:id/download", a.downloadOneDriveBackup)
+		admin.POST("/maintenance/onedrive/backups/:id/restore", a.restoreOneDriveBackup)
+		admin.DELETE("/maintenance/onedrive/backups/:id", a.deleteOneDriveBackup)
+	}
+
+	a.mountFrontend(r)
+	return r
+}
+
+// handleReady reports whether the process can serve database-backed requests.
+// Liveness intentionally remains a static /api/health response so an external
+// supervisor does not restart the process solely because its database has a
+// transient outage.
+func (a *App) handleReady(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+
+	if a.db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "database unavailable"})
+		return
+	}
+	sqlDB, err := a.db.DB()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "database unavailable"})
+		return
+	}
+	if err := sqlDB.PingContext(ctx); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "database unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// webDir resolves the built frontend directory from config (or env override
+// applied at config-load time).
+func (a *App) webDir() string {
+	return a.cfg.WebDir
+}
+
+func (a *App) mountFrontend(r *gin.Engine) {
+	dir := a.webDir()
+
+	// Go's built-in MIME table has no entry for .webmanifest, so without this
+	// http.ServeContent falls back to content sniffing and serves the manifest
+	// as text/plain. Browsers then reject it and the app never becomes
+	// installable. AddExtensionType is safe to call unconditionally.
+	if err := mime.AddExtensionType(".webmanifest", "application/manifest+json"); err != nil {
+		log.Printf("cannot register webmanifest MIME type: %v", err)
+	}
+
+	for _, staticDir := range []string{"assets", "logos"} {
+		path := filepath.Join(dir, staticDir)
+		if dirExists(path) {
+			r.Static("/"+staticDir, path)
+		}
+	}
+	// Root-level files live next to index.html in the built dist and must be
+	// served verbatim — the NoRoute fallback would otherwise answer with
+	// index.html and the browser would never see the icon, manifest or worker.
+	rootFiles := []struct {
+		name string
+		// cacheControl is empty for files that keep the previous behaviour
+		// (no explicit header, so the browser applies heuristic freshness).
+		cacheControl string
+	}{
+		{name: "favicon.svg"},
+		{name: "favicon-32x32.png"},
+		{name: "apple-touch-icon.png"},
+		// PWA entry points, revalidated on every load. None of them is
+		// content-hashed, so a long max-age would strand an installed app on an
+		// outdated worker (delaying an in-place upgrade by up to 24h) or on a
+		// manifest still pointing at icons the new build replaced.
+		{name: "manifest.webmanifest", cacheControl: "no-cache"},
+		{name: "sw.js", cacheControl: "no-cache"},
+		{name: "icon-192.png", cacheControl: "no-cache"},
+		{name: "icon-512.png", cacheControl: "no-cache"},
+		{name: "icon-maskable-192.png", cacheControl: "no-cache"},
+		{name: "icon-maskable-512.png", cacheControl: "no-cache"},
+	}
+	for _, file := range rootFiles {
+		path := filepath.Join(dir, file.name)
+		if !fileExists(path) {
+			continue
+		}
+		// sw.js in particular must never fall through to the SPA catch-all: a
+		// worker script is parsed as JavaScript, so an HTML response makes
+		// registration fail and silently disables installation for the origin.
+		serve := func(c *gin.Context) {
+			if file.cacheControl != "" {
+				c.Header("Cache-Control", file.cacheControl)
+			}
+			c.File(path)
+		}
+		r.GET("/"+file.name, serve)
+		// gin does not infer HEAD from GET, and net/http drops the body of a
+		// HEAD response for us.
+		r.HEAD("/"+file.name, serve)
+	}
+	r.NoRoute(func(c *gin.Context) {
+		if strings.HasPrefix(c.Request.URL.Path, "/api") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		index := filepath.Join(dir, "index.html")
+		if fileExists(index) {
+			// The SPA entry selects content-hashed JavaScript bundles. Never cache
+			// index.html itself, otherwise a long-lived admin tab can keep loading an
+			// obsolete Users chunk after an in-place deployment.
+			c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+			c.Header("Pragma", "no-cache")
+			c.Header("Expires", "0")
+			c.File(index)
+			return
+		}
+		c.String(http.StatusOK,
+			"SingBox Panel backend is running.\nBuild the frontend: cd web && npm ci && npm run build")
+	})
+}
+
+// Run starts the reconciler and HTTP server, shutting down when ctx is cancelled.
+func (a *App) Run(ctx context.Context) error {
+	ResetServersOffline(a.db)
+
+	go a.host.run(ctx)
+	if a.hub != nil && a.hub.traffic != nil {
+		go a.hub.traffic.run(ctx)
+	}
+
+	rec := NewReconciler(a.db, func(serverIDs []uint) { a.refreshUserProxyAccess(serverIDs) })
+	go rec.Run(ctx)
+	go a.customSubscriptions.run(ctx)
+	go a.runOneDriveBackupScheduler(ctx)
+
+	srv := newPanelHTTPServer(a.cfg.Listen, a.engine)
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+
+	log.Printf("panel listening on %s (base URL %s)", a.cfg.Listen, a.cfg.BaseURL)
+	err := srv.ListenAndServe()
+	// Persist buffered traffic history before the process exits.
+	a.flushTraffic()
+	if err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+// flushTraffic writes buffered traffic history so reads include it.
+func (a *App) flushTraffic() {
+	if a.hub == nil || a.hub.traffic == nil {
+		return
+	}
+	if err := a.hub.traffic.flush(); err != nil {
+		log.Printf("traffic: flush history: %v", err)
+	}
+}
+
+const (
+	panelReadHeaderTimeout = 10 * time.Second
+	panelReadTimeout       = 30 * time.Second
+	panelIdleTimeout       = 60 * time.Second
+)
+
+func newPanelHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: panelReadHeaderTimeout,
+		ReadTimeout:       panelReadTimeout,
+		IdleTimeout:       panelIdleTimeout,
+		MaxHeaderBytes:    1 << 20,
+	}
+}
+
+func (a *App) allowWSHandshake(key string, now time.Time) time.Duration {
+	a.wsLimiterMu.Lock()
+	if a.wsLimiter == nil {
+		a.wsLimiter = newWSHandshakeLimiter()
+	}
+	limiter := a.wsLimiter
+	a.wsLimiterMu.Unlock()
+	return limiter.allow(key, now)
+}
+
+func panelRequestLogger(subscriptionPrefix string) gin.HandlerFunc {
+	prefix := strings.TrimRight(subscriptionPrefix, "/") + "/"
+	return gin.LoggerWithConfig(gin.LoggerConfig{
+		SkipQueryString: true,
+		Skip: func(c *gin.Context) bool {
+			return subscriptionRequestPath(c.Request.URL.Path, prefix)
+		},
+	})
+}
+
+func subscriptionRequestPath(path, prefix string) bool {
+	return strings.HasPrefix(path, prefix)
+}
+
+func corsMiddleware(baseURL, environment string) gin.HandlerFunc {
+	allowedOrigin := originFromBaseURL(baseURL)
+	return func(c *gin.Context) {
+		requestOrigin := strings.TrimSpace(c.GetHeader("Origin"))
+		if requestOrigin != "" {
+			c.Header("Vary", "Origin")
+			if requestOrigin == allowedOrigin || (strings.EqualFold(environment, "development") && isLoopbackOrigin(requestOrigin)) {
+				c.Header("Access-Control-Allow-Origin", allowedOrigin)
+				if requestOrigin != allowedOrigin {
+					c.Header("Access-Control-Allow-Origin", requestOrigin)
+				}
+				c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			} else {
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
+		}
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
+func isLoopbackOrigin(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := strings.Trim(u.Hostname(), "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func originFromBaseURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+func securityHeadersMiddleware(baseURL string) gin.HandlerFunc {
+	secureOrigin := strings.HasPrefix(originFromBaseURL(baseURL), "https://")
+	return func(c *gin.Context) {
+		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+		if secureOrigin {
+			c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Next()
+	}
+}
+
+func dirExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
+func fileExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir()
+}

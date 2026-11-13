@@ -3,8 +3,9 @@ import { Button, Grid, Modal, Typography, message } from '../../ui'
 import { ChevronRight } from 'lucide-react'
 import { QRCodeSVG } from 'qrcode.react'
 import { errMsg, getMe, getUserNodes, resetSub } from '../../api'
-import type { SubscriptionSyncResult, UserNode } from '../../api'
+import type { SubscriptionSyncResult, UserNode, UserTrafficInfo } from '../../api'
 import type { User } from '../../types'
+import { formatBytes } from '../../util'
 import { SubscriptionLinks } from './SubscriptionLinks'
 import { SubscriptionSyncStatus } from './SubscriptionSyncStatus'
 import { useAuth } from '../../store'
@@ -30,6 +31,7 @@ export default function Dashboard() {
   const setUser = useAuth((s) => s.setUser)
   const [user, setLocalUser] = useState<User | null>(null)
   const [subUrl, setSubUrl] = useState('')
+  const [traffic, setTraffic] = useState<UserTrafficInfo | null>(null)
   const [resetSync, setResetSync] = useState<SubscriptionSyncResult>()
   const [nodes, setNodes] = useState<UserNode[]>([])
   const [continentNodes, setContinentNodes] = useState<Partial<Record<Continent, UserNode[]>>>({})
@@ -56,6 +58,7 @@ export default function Dashboard() {
         if (generation !== loadRef.current.generation) return
         setLocalUser(d.user)
         setSubUrl(d.subscription_url)
+        setTraffic(d.traffic ?? null)
         setUser(d.user)
       })
       .catch((e) => {
@@ -162,6 +165,34 @@ export default function Dashboard() {
           </div>
           <SubscriptionSyncStatus key={subUrl} initial={resetSync} />
         </Section>
+
+        {traffic && traffic.quota > 0 && (
+          <Section title="本周期流量">
+            <div className="sub-quota">
+              <div
+                className="sub-quota-bar"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={traffic.quota}
+                aria-valuenow={Math.min(traffic.used, traffic.quota)}
+                style={{ height: 8, borderRadius: 4, background: 'var(--border, #e5e5e5)', overflow: 'hidden' }}
+              >
+                <div
+                  style={{
+                    width: `${Math.min(100, (traffic.used / traffic.quota) * 100)}%`,
+                    height: '100%',
+                    background: traffic.exceeded ? '#d93025' : 'var(--primary, #1677ff)',
+                  }}
+                />
+              </div>
+              <div className="mono" style={{ marginTop: 8 }}>
+                {formatBytes(traffic.used)} / {formatBytes(traffic.quota)}
+                <span className="faint">　{new Date(traffic.next_reset).toLocaleDateString()} 重置</span>
+              </div>
+              {traffic.exceeded && <div style={{ marginTop: 6, color: '#d93025' }}>本周期流量已用尽，订阅与节点暂不可用，重置后自动恢复。</div>}
+            </div>
+          </Section>
+        )}
 
         <Section title="节点">
           <RequestState loading={nodesLoading} error={nodesError} hasData={nodes.length > 0} empty={!nodesLoading && !nodesError && nodes.length === 0} emptyDescription="暂无节点" onRetry={load}>

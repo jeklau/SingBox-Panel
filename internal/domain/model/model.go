@@ -83,6 +83,13 @@ type User struct {
 	// explicit access above. nil = no template.
 	TemplateID *uint `gorm:"index" json:"template_id"`
 
+	// TrafficQuotaBytes caps upload+download per monthly cycle; 0 = unlimited.
+	// Usage is attributed on multi-user inbounds only, and the cycle resets on
+	// TrafficResetDay (1-31, UTC). Over quota the user is treated like an
+	// expired one: no subscription and no multi-user credentials.
+	TrafficQuotaBytes uint64 `gorm:"not null;default:0" json:"quota_bytes"`
+	TrafficResetDay   int    `gorm:"not null;default:1" json:"quota_reset_day"`
+
 	ExpireAt *time.Time `json:"expire_at"` // nil = never
 
 	Enabled bool `gorm:"index" json:"enabled"`

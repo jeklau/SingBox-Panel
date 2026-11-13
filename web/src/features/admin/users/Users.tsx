@@ -155,6 +155,23 @@ export default function Users() {
       },
     },
     {
+      title: '本周期配额',
+      key: 'quota',
+      width: 150,
+      responsive: ['md'],
+      render: (_, u) => {
+        const quota = u.quota_bytes ?? 0
+        if (quota <= 0) return <span className="faint">不限</span>
+        const used = u.traffic_cycle_used ?? 0
+        return (
+          <span className="mono um-stack" style={used >= quota ? { color: '#d93025' } : undefined}>
+            <span>{formatBytes(used)} / {formatBytes(quota)}</span>
+            {used >= quota && <small>已用尽</small>}
+          </span>
+        )
+      },
+    },
+    {
       title: '近 30 天',
       key: 'traffic',
       width: 120,

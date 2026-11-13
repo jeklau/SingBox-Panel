@@ -73,6 +73,19 @@ func (r *Reconciler) tick() {
 		u := &users[i]
 		active := u.Enabled && !u.Expired(now)
 		previous, known := r.active[u.ID]
+		if active && u.TrafficQuotaBytes > 0 {
+			over, err := userOverQuota(r.db, u, now)
+			switch {
+			case err != nil:
+				// Never flip access on a failed read; keep the last known state.
+				log.Printf("reconciler: read quota usage for user %d: %v", u.ID, err)
+				if known {
+					active = previous
+				}
+			case over:
+				active = false
+			}
+		}
 		if known && previous != active && r.onAccessChange != nil {
 			r.onAccessChange(u.ServerIDs)
 			log.Printf("reconciler: user %d (%s) proxy access changed to active=%t", u.ID, u.Email, active)

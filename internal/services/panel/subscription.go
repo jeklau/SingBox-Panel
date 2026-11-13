@@ -63,9 +63,26 @@ func (a *App) handleSubscription(c *gin.Context) {
 	// A disabled or expired account must stop receiving nodes. Report the expiry
 	// so the client can show why, but hand out nothing.
 	if !userActive(&user) {
-		setSubscriptionUserinfo(c, &user)
+		setSubscriptionUserinfo(c, &user, nil)
 		c.String(http.StatusForbidden, "account disabled or expired")
 		return
+	}
+
+	// With a quota, report usage and stop handing out nodes once it is spent.
+	// A failed ledger read must not turn into an unlimited or empty subscription.
+	var usage *quotaUsage
+	if user.TrafficQuotaBytes > 0 {
+		u, err := userCycleUsage(a.db, &user, time.Now())
+		if err != nil {
+			c.String(http.StatusServiceUnavailable, "subscription temporarily unavailable")
+			return
+		}
+		usage = &u
+		if quotaExceeded(&user, u) {
+			setSubscriptionUserinfo(c, &user, usage)
+			c.String(http.StatusForbidden, "traffic quota exceeded")
+			return
+		}
 	}
 
 	nodes, err := a.gatherNodesWithError(&user)
@@ -75,7 +92,7 @@ func (a *App) handleSubscription(c *gin.Context) {
 	}
 
 	// Usage header consumed by many clients to display quota.
-	setSubscriptionUserinfo(c, &user)
+	setSubscriptionUserinfo(c, &user, usage)
 
 	switch subFormat(c) {
 	case "sing-box", "singbox":
@@ -113,12 +130,22 @@ func subFormat(c *gin.Context) string {
 	}
 }
 
-func setSubscriptionUserinfo(c *gin.Context, u *model.User) {
-	// Only expiry is reported until sing-box exposes exact authenticated-user
-	// byte counters. Emitting upload/download/total=0 would make clients display
-	// a bogus quota, so unknown traffic fields are deliberately omitted.
+func setSubscriptionUserinfo(c *gin.Context, u *model.User, usage *quotaUsage) {
+	// Traffic fields are emitted only for users with a quota, where usage is
+	// attributed per user. Without one, upload/download/total=0 would make
+	// clients display a bogus quota, so unknown traffic fields are omitted.
+	var parts []string
+	if usage != nil && u.TrafficQuotaBytes > 0 {
+		parts = append(parts,
+			fmt.Sprintf("upload=%d", usage.Upload),
+			fmt.Sprintf("download=%d", usage.Download),
+			fmt.Sprintf("total=%d", u.TrafficQuotaBytes))
+	}
 	if u.ExpireAt != nil {
-		c.Header("Subscription-Userinfo", fmt.Sprintf("expire=%d", u.ExpireAt.Unix()))
+		parts = append(parts, fmt.Sprintf("expire=%d", u.ExpireAt.Unix()))
+	}
+	if len(parts) > 0 {
+		c.Header("Subscription-Userinfo", strings.Join(parts, "; "))
 	}
 	c.Header("Profile-Update-Interval", "12")
 }

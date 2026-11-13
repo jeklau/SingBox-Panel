@@ -9,6 +9,11 @@ export interface User {
   server_ids: number[]
   inbound_ids: number[]
   template_id?: number | null
+  // Per-cycle traffic quota in bytes (0 = unlimited) and its UTC reset day.
+  quota_bytes?: number
+  quota_reset_day?: number
+  // Usage in the current quota cycle; admin list only, and only with a quota.
+  traffic_cycle_used?: number
   node_count?: number
   expire_at: string | null
   enabled: boolean

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -35,10 +36,20 @@ func (a *App) handleMe(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"user":             u,
 		"subscription_url": a.subURL(u.SubToken),
-	})
+	}
+	// A user's own quota usage; omitted when no quota is set.
+	if u.TrafficQuotaBytes > 0 {
+		usage, err := userCycleUsage(a.db, &u, time.Now())
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "暂时无法读取流量，请稍后重试"})
+			return
+		}
+		resp["traffic"] = newUserTrafficInfo(&u, usage)
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // handleUserNodes lists the nodes the current user can use.
@@ -52,6 +63,17 @@ func (a *App) handleUserNodes(c *gin.Context) {
 	if u.Role != model.RoleAdmin && !userActive(&u) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "账号已停用或已到期"})
 		return
+	}
+	if u.Role != model.RoleAdmin {
+		over, err := userOverQuota(a.db, &u, time.Now())
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "暂时无法读取节点，请稍后重试"})
+			return
+		}
+		if over {
+			c.JSON(http.StatusForbidden, gin.H{"error": "本周期流量已用尽"})
+			return
+		}
 	}
 	nodes, err := a.userNodeDetails(&u)
 	if err != nil {

@@ -66,6 +66,15 @@ func proxyUsersForInbound(db *gorm.DB, inbound *model.Inbound, settings singbox.
 		if user.Expired(now) || !userInboundGranted(user, tpl, &server, inbound) {
 			continue
 		}
+		// An exhausted quota revokes the credential like expiry does; it returns
+		// when the next cycle starts or the quota is raised.
+		over, err := userOverQuota(db, user, now)
+		if err != nil {
+			return nil, err
+		}
+		if over {
+			continue
+		}
 		identity := proxyIdentity(user, inbound.ID)
 		identity.Name = proxyTrafficName(user)
 		identities = append(identities, identity)

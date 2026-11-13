@@ -395,6 +395,11 @@ var applicationMigrations = []schemaMigration{
 			return tx.AutoMigrate(&model.SubscriptionTemplate{}, &model.User{})
 		},
 	},
+	{
+		version: 34,
+		name:    "per-user traffic quota",
+		up:      func(tx *gorm.DB) error { return tx.AutoMigrate(&model.User{}) },
+	},
 }
 
 // migrationReplaySafe records whether an interrupted attempt of each migration
@@ -447,6 +452,7 @@ var migrationReplaySafe = map[uint]bool{
 	31: true,  // AutoMigrate of external subscription sync status
 	32: true,  // AutoMigrate adds nullable outbound source columns
 	33: true,  // AutoMigrate adds the template table and a nullable users.template_id
+	34: true,  // AutoMigrate adds defaulted quota columns to users
 }
 
 // runSchemaMigrations applies every pending migration in order. If any

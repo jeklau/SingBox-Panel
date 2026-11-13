@@ -72,9 +72,18 @@ export const logoutSession = () =>
   http.post<{ ok: boolean }>('/api/auth/logout', undefined, { timeout: 5000 }).then((r) => r.data)
 
 // ---- current user ----
+export interface UserTrafficInfo {
+  used: number
+  upload: number
+  download: number
+  quota: number
+  cycle_start: string
+  next_reset: string
+  exceeded: boolean
+}
 export const getMe = (signal?: AbortSignal) =>
   http
-    .get<{ user: User; subscription_url: string }>('/api/user/me', { signal })
+    .get<{ user: User; subscription_url: string; traffic?: UserTrafficInfo }>('/api/user/me', { signal })
     .then((r) => r.data)
 
 export interface UserNode {
@@ -324,6 +333,8 @@ interface UserBody {
   expire_at?: number | null
   enabled?: boolean
   template_id?: number // update only: 0 unbinds the subscription template
+  quota_bytes?: number // update only: 0 = unlimited
+  quota_reset_day?: number // update only: 1-31 (UTC)
 }
 export const listUsers =(signal?: AbortSignal) =>
   http.get<{ users: User[] }>('/api/admin/users', { signal }).then((r) => r.data.users)

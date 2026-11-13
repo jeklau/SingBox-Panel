@@ -37,6 +37,9 @@ type userReq struct {
 	ExpireAt   *int64 `json:"expire_at"`   // unix seconds; 0/null = never
 	Enabled    *bool  `json:"enabled"`
 	TemplateID *uint  `json:"template_id"` // update only: nil = unchanged, 0 = unbind
+
+	TrafficQuotaBytes *uint64 `json:"quota_bytes"`     // update only: nil = unchanged, 0 = unlimited
+	TrafficResetDay   *int    `json:"quota_reset_day"` // update only: 1-31 (UTC)
 }
 
 type userAccessReq struct {
@@ -72,6 +75,8 @@ type userListItem struct {
 	// cannot see it through /api/user/me.
 	TrafficUpload30d   uint64 `json:"traffic_upload_30d"`
 	TrafficDownload30d uint64 `json:"traffic_download_30d"`
+	// Usage in the current quota cycle; only filled for users with a quota.
+	TrafficCycleUsed uint64 `json:"traffic_cycle_used"`
 }
 
 func normalizedIDs(ids []uint) []uint {
@@ -607,10 +612,19 @@ func (a *App) listUsers(c *gin.Context) {
 		}
 		recent := activity[users[i].ID]
 		usage := traffic30d[users[i].ID]
-		items = append(items, userListItem{
+		item := userListItem{
 			User: users[i], NodeCount: count, SubFetches24h: recent.Fetches, SubIPs24h: recent.IPs,
 			TrafficUpload30d: usage.Upload, TrafficDownload30d: usage.Download,
-		})
+		}
+		if users[i].TrafficQuotaBytes > 0 {
+			cycle, err := userCycleUsage(a.db, &users[i], time.Now())
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			item.TrafficCycleUsed = cycle.total()
+		}
+		items = append(items, item)
 	}
 	c.JSON(http.StatusOK, gin.H{"users": items})
 }
@@ -760,6 +774,23 @@ func (a *App) updateUser(c *gin.Context) {
 		u.InboundIDs = normalizedIDs(req.InboundIDs)
 		accessChanged = true
 	}
+	if req.TrafficQuotaBytes != nil {
+		// 1 PiB is far beyond any real allowance and keeps byte math far from overflow.
+		if *req.TrafficQuotaBytes > 1<<50 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "traffic quota is too large"})
+			return
+		}
+		u.TrafficQuotaBytes = *req.TrafficQuotaBytes
+		columns = append(columns, "TrafficQuotaBytes")
+	}
+	if req.TrafficResetDay != nil {
+		if !validTrafficResetDay(*req.TrafficResetDay) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "traffic reset day must be between 1 and 31"})
+			return
+		}
+		u.TrafficResetDay = *req.TrafficResetDay
+		columns = append(columns, "TrafficResetDay")
+	}
 	templateChanged := false
 	if req.TemplateID != nil {
 		if *req.TemplateID == 0 {
@@ -837,6 +868,8 @@ func (a *App) updateUser(c *gin.Context) {
 		// lose this user's credentials.
 		a.refreshUserProxyAccess(oldServerIDs, u.ServerIDs, a.allServerIDs())
 	} else {
+		// This also applies a changed quota or reset day at once; the reconciler
+		// would otherwise only notice on its next tick.
 		a.refreshUserProxyAccess(oldServerIDs, u.ServerIDs)
 	}
 	c.JSON(http.StatusOK, gin.H{"user": u})

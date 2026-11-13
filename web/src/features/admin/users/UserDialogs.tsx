@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Form, Input, Modal, Segmented, Select, Table, message } from '../../../ui'
+import { Form, Input, InputNumber, Modal, Segmented, Select, Table, message } from '../../../ui'
 import { createUser, errMsg, getUserTraffic, listSubscriptionTemplates, updateUser } from '../../../api'
 import type { SubscriptionTemplate } from '../../../api'
 import type { User, UserTrafficInbound, UserTrafficRange, UserTrafficSeries } from '../../../types'
@@ -8,6 +8,10 @@ import { ProtocolTag } from '../servers/ServerTraffic'
 import { RequestState } from '../../../components/RequestState'
 import { MODAL_SM } from '../../../ui/modal'
 import { SubscriptionFetchHistory } from './SubscriptionFetchHistory'
+
+const GB = 1024 ** 3
+export const bytesToGB = (bytes: number) => Math.round((bytes / GB) * 100) / 100
+export const gbToBytes = (gb: number) => (Number.isFinite(gb) && gb > 0 ? Math.round(gb * GB) : 0)
 
 export function UserAccountDialog({ user, onClose, onSaved }: {
   user?: User
@@ -20,7 +24,14 @@ export function UserAccountDialog({ user, onClose, onSaved }: {
   const lock = useRef(false)
   useEffect(() => {
     form.resetFields()
-    if (user) form.setFieldsValue({ email: user.email, template_id: user.template_id ?? 0 })
+    if (user) {
+      form.setFieldsValue({
+        email: user.email,
+        template_id: user.template_id ?? 0,
+        quota_gb: bytesToGB(user.quota_bytes ?? 0),
+        reset_day: user.quota_reset_day ?? 1,
+      })
+    }
   }, [user?.id])
   // Templates can only be bound to an existing account.
   useEffect(() => {
@@ -41,9 +52,21 @@ export function UserAccountDialog({ user, onClose, onSaved }: {
     setSaving(true)
     try {
       const values = await form.validateFields()
-      const body: { email: string; password?: string; template_id?: number } = {
+      const body: {
+        email: string
+        password?: string
+        template_id?: number
+        quota_bytes?: number
+        quota_reset_day?: number
+      } = {
         email: values.email,
         password: values.password || undefined,
+      }
+      if (user) {
+        const quota = gbToBytes(Number(values.quota_gb ?? 0))
+        if (quota !== (user.quota_bytes ?? 0)) body.quota_bytes = quota
+        const day = Number(values.reset_day ?? 1)
+        if (day !== (user.quota_reset_day ?? 1)) body.quota_reset_day = day
       }
       if (user && templates) {
         const next = Number(values.template_id ?? 0)
@@ -66,6 +89,20 @@ export function UserAccountDialog({ user, onClose, onSaved }: {
       <Form.Item name="password" label={user ? '新密码' : '密码'} rules={user ? [{ max: 72 }] : [{ required: true, message: '请输入密码' }, { max: 72 }]}>
         <Input.Password placeholder={user ? '不修改' : undefined} autoComplete="new-password" />
       </Form.Item>
+      {user && (
+        <>
+          <Form.Item
+            name="quota_gb"
+            label="每周期流量配额（GB，0 为不限）"
+            extra="仅统计多用户入站上的流量；用尽后订阅返回 403，并撤销服务器上的用户凭据，下一个周期自动恢复。"
+          >
+            <InputNumber min={0} max={1048576} precision={2} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item name="reset_day" label="每月重置日（UTC，1-31）">
+            <InputNumber min={1} max={31} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+        </>
+      )}
       {user && templates && (
         <Form.Item name="template_id" label="订阅模板" extra="模板命中的节点会与手动授权的节点一起进入订阅，新节点自动生效。">
           <Select

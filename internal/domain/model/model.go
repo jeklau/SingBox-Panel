@@ -79,6 +79,10 @@ type User struct {
 	// inbound on the selected servers (the previous, server-level behaviour).
 	InboundIDs []uint `gorm:"serializer:json" json:"inbound_ids"`
 
+	// TemplateID binds a SubscriptionTemplate whose matches are added to the
+	// explicit access above. nil = no template.
+	TemplateID *uint `gorm:"index" json:"template_id"`
+
 	ExpireAt *time.Time `json:"expire_at"` // nil = never
 
 	Enabled bool `gorm:"index" json:"enabled"`
@@ -499,6 +503,7 @@ func AllModels() []any {
 	return []any{
 		&User{}, &UserNodeOrder{}, &Server{}, &Inbound{}, &Outbound{}, &RouteRule{}, &RuleSet{}, &Setting{}, &TrafficRecord{},
 		&CustomNodeSubscription{}, &CustomNode{}, &TrafficHourly{}, &SubscriptionFetch{}, &TrafficUserHourly{}, &UserTrafficIdentity{}, &TrafficReportCursor{}, &InboundTrafficIdentity{},
+		&SubscriptionTemplate{},
 	}
 }
 

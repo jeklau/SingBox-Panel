@@ -21,12 +21,28 @@ type subscriptionSyncStatus struct {
 // Only managed nodes with a granted multi-user inbound derive credentials from
 // this account. Raw, shared-credential and external nodes must stay untouched.
 func subscriptionSyncServerIDs(db *gorm.DB, user *model.User) ([]uint, error) {
-	if len(user.ServerIDs) == 0 {
+	var tpl *model.SubscriptionTemplate
+	if user.TemplateID != nil {
+		templates, err := enabledTemplates(db)
+		if err != nil {
+			return nil, err
+		}
+		tpl = templates[*user.TemplateID]
+	}
+	if len(user.ServerIDs) == 0 && tpl == nil {
 		return nil, nil
 	}
 	var servers []model.Server
-	if err := db.Select("id", "config_mode", "raw_config").Where("id IN ?", user.ServerIDs).Find(&servers).Error; err != nil {
+	serverQuery := db.Select("id", "name", "region", "config_mode", "raw_config")
+	if tpl == nil {
+		serverQuery = serverQuery.Where("id IN ?", user.ServerIDs)
+	}
+	if err := serverQuery.Find(&servers).Error; err != nil {
 		return nil, err
+	}
+	serversByID := make(map[uint]*model.Server, len(servers))
+	for i := range servers {
+		serversByID[servers[i].ID] = &servers[i]
 	}
 	var managedIDs []uint
 	for _, server := range servers {
@@ -38,12 +54,13 @@ func subscriptionSyncServerIDs(db *gorm.DB, user *model.User) ([]uint, error) {
 		return nil, nil
 	}
 	var inbounds []model.Inbound
-	if err := db.Select("id", "server_id", "type", "settings").Where("server_id IN ?", managedIDs).Find(&inbounds).Error; err != nil {
+	if err := db.Select("id", "server_id", "tag", "type", "settings").Where("server_id IN ?", managedIDs).Find(&inbounds).Error; err != nil {
 		return nil, err
 	}
 	var ids []uint
-	for _, inbound := range inbounds {
-		if !user.HasInbound(inbound.ServerID, inbound.ID) {
+	for i := range inbounds {
+		inbound := inbounds[i]
+		if !userInboundGranted(user, tpl, serversByID[inbound.ServerID], &inbound) {
 			continue
 		}
 		var settings singbox.InboundSettings

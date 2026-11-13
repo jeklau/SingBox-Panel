@@ -136,9 +136,25 @@ func (a *App) gatherNodes(user *model.User) []node {
 // empty subscription, which clients could cache as a node deletion.
 func (a *App) gatherNodesWithError(user *model.User) ([]node, error) {
 	var out []node
-	if len(user.ServerIDs) > 0 {
+	// A bound, enabled template adds every node it matches to the explicit
+	// grants, so new nodes reach the user without editing their access.
+	var tpl *model.SubscriptionTemplate
+	if user.TemplateID != nil {
+		var found []model.SubscriptionTemplate
+		if err := a.db.Where("id = ?", *user.TemplateID).Limit(1).Find(&found).Error; err != nil {
+			return nil, err
+		}
+		if len(found) == 1 && found[0].Enabled {
+			tpl = &found[0]
+		}
+	}
+	if len(user.ServerIDs) > 0 || tpl != nil {
 		var servers []model.Server
-		if err := a.db.Where("id IN ?", user.ServerIDs).Order("id").Find(&servers).Error; err != nil {
+		serverQuery := a.db.Order("id")
+		if tpl == nil {
+			serverQuery = serverQuery.Where("id IN ?", user.ServerIDs)
+		}
+		if err := serverQuery.Find(&servers).Error; err != nil {
 			return nil, err
 		}
 		applyServerOrder(a.db, servers)
@@ -157,11 +173,13 @@ func (a *App) gatherNodesWithError(user *model.User) ([]node, error) {
 			if err := a.db.Where("server_id = ? AND enabled = ?", srv.ID, true).Order("id").Find(&inbounds).Error; err != nil {
 				return nil, err
 			}
-			first := len(out)
+			var batch []node
 			for _, ib := range inbounds {
 				// Respect per-inbound access: a protocol the user isn't granted must
-				// not appear in their subscription.
-				if !user.HasInbound(srv.ID, ib.ID) {
+				// not appear in their subscription unless the template selects it.
+				explicit := user.HasInbound(srv.ID, ib.ID)
+				granted := explicit || tpl.Matches(managedTemplateNode(srv, &ib))
+				if !granted {
 					continue
 				}
 				var st singbox.InboundSettings
@@ -169,6 +187,9 @@ func (a *App) gatherNodesWithError(user *model.User) ([]node, error) {
 					_ = json.Unmarshal(ib.Settings, &st)
 				}
 				if err := st.ValidateMultiUser(string(ib.Type)); err != nil {
+					if !explicit {
+						continue // a broken inbound the user was never granted must not break their subscription
+					}
 					return nil, fmt.Errorf("inbound %q settings: %w", ib.Tag, err)
 				}
 				var identity singbox.ProxyUser
@@ -180,7 +201,7 @@ func (a *App) gatherNodesWithError(user *model.User) ([]node, error) {
 					st.SingleUser = true
 					identity = st.SingleUserIdentity()
 				}
-				out = append(out, node{
+				batch = append(batch, node{
 					orderType: userNodeTypeManaged,
 					orderID:   ib.ID,
 					tag:       ib.Tag,
@@ -192,7 +213,8 @@ func (a *App) gatherNodesWithError(user *model.User) ([]node, error) {
 					user:      identity,
 				})
 			}
-			nameServerNodes(srv.Name, out[first:])
+			nameServerNodes(srv.Name, batch)
+			out = append(out, batch...)
 		}
 	}
 
@@ -204,10 +226,17 @@ func (a *App) gatherNodesWithError(user *model.User) ([]node, error) {
 	}
 	for i := range customs {
 		c := &customs[i]
-		if !c.HasUser(user.ID) {
+		explicit := c.HasUser(user.ID)
+		if !explicit && tpl == nil {
 			continue
 		}
 		if n, ok := a.customNodeToNode(c); ok {
+			if !explicit && !tpl.Matches(model.TemplateNode{
+				Name: n.name, Tag: n.tag, Protocol: n.typ, Server: c.SourceName,
+				Region: n.region, Group: c.Group, Source: "external",
+			}) {
+				continue
+			}
 			n.orderType = userNodeTypeCustom
 			n.orderID = c.ID
 			out = append(out, n)

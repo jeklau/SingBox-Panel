@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { Form, Input, Modal, Segmented, Table, message } from '../../../ui'
-import { createUser, errMsg, getUserTraffic, updateUser } from '../../../api'
+import { Form, Input, Modal, Segmented, Select, Table, message } from '../../../ui'
+import { createUser, errMsg, getUserTraffic, listSubscriptionTemplates, updateUser } from '../../../api'
+import type { SubscriptionTemplate } from '../../../api'
 import type { User, UserTrafficInbound, UserTrafficRange, UserTrafficSeries } from '../../../types'
 import { formatBytes } from '../../../util'
 import { ProtocolTag } from '../servers/ServerTraffic'
@@ -15,10 +16,24 @@ export function UserAccountDialog({ user, onClose, onSaved }: {
 }) {
   const [form] = Form.useForm()
   const [saving, setSaving] = useState(false)
+  const [templates, setTemplates] = useState<SubscriptionTemplate[] | null>(null)
   const lock = useRef(false)
   useEffect(() => {
     form.resetFields()
-    if (user) form.setFieldsValue({ email: user.email })
+    if (user) form.setFieldsValue({ email: user.email, template_id: user.template_id ?? 0 })
+  }, [user?.id])
+  // Templates can only be bound to an existing account.
+  useEffect(() => {
+    if (!user) return
+    const controller = new AbortController()
+    listSubscriptionTemplates(controller.signal)
+      .then((rows) => {
+        if (!controller.signal.aborted) setTemplates(rows)
+      })
+      .catch(() => {
+        // Leave the selector hidden; the rest of the account can still be saved.
+      })
+    return () => controller.abort()
   }, [user?.id])
   const submit = async () => {
     if (lock.current) return
@@ -26,7 +41,14 @@ export function UserAccountDialog({ user, onClose, onSaved }: {
     setSaving(true)
     try {
       const values = await form.validateFields()
-      const body = { email: values.email, password: values.password || undefined }
+      const body: { email: string; password?: string; template_id?: number } = {
+        email: values.email,
+        password: values.password || undefined,
+      }
+      if (user && templates) {
+        const next = Number(values.template_id ?? 0)
+        if (next !== (user.template_id ?? 0)) body.template_id = next
+      }
       const saved = user ? await updateUser(user.id, body) : await createUser(body)
       message.success('已保存用户')
       onSaved(saved)
@@ -44,6 +66,16 @@ export function UserAccountDialog({ user, onClose, onSaved }: {
       <Form.Item name="password" label={user ? '新密码' : '密码'} rules={user ? [{ max: 72 }] : [{ required: true, message: '请输入密码' }, { max: 72 }]}>
         <Input.Password placeholder={user ? '不修改' : undefined} autoComplete="new-password" />
       </Form.Item>
+      {user && templates && (
+        <Form.Item name="template_id" label="订阅模板" extra="模板命中的节点会与手动授权的节点一起进入订阅，新节点自动生效。">
+          <Select
+            options={[
+              { value: 0, label: '不使用模板' },
+              ...templates.map((t) => ({ value: t.id, label: t.enabled ? t.name : `${t.name}（已停用）` })),
+            ]}
+          />
+        </Form.Item>
+      )}
     </Form>
   </Modal>
 }

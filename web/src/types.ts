@@ -8,6 +8,7 @@ export interface User {
   role: Role
   server_ids: number[]
   inbound_ids: number[]
+  template_id?: number | null
   node_count?: number
   expire_at: string | null
   enabled: boolean

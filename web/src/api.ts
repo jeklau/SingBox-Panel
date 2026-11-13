@@ -323,8 +323,9 @@ interface UserBody {
   inbound_ids?: number[]
   expire_at?: number | null
   enabled?: boolean
+  template_id?: number // update only: 0 unbinds the subscription template
 }
-export const listUsers = (signal?: AbortSignal) =>
+export const listUsers =(signal?: AbortSignal) =>
   http.get<{ users: User[] }>('/api/admin/users', { signal }).then((r) => r.data.users)
 export const getUser = (id: number, signal?: AbortSignal) =>
   http.get<{ user: User; subscription_url: string }>(`/api/admin/users/${id}`, { signal }).then((r) => r.data)
@@ -506,6 +507,38 @@ export const syncCustomNodeSubscription = (id: number) =>
   http
     .post<{ subscription: CustomNodeSubscription; sync: CustomNodeSubscriptionSync }>(`/api/admin/custom-node-subscriptions/${id}/sync`)
     .then((r) => r.data)
+
+// ---- admin: subscription templates (rule-based node selection bound to users) ----
+export type TemplateField = 'name' | 'tag' | 'protocol' | 'server' | 'region' | 'group' | 'source'
+export type TemplateMatch = 'contains' | 'equals' | 'regex'
+export interface TemplateRule {
+  field: TemplateField
+  match: TemplateMatch
+  value: string
+  exclude: boolean
+}
+export interface SubscriptionTemplate {
+  id: number
+  name: string
+  enabled: boolean
+  include_all: boolean
+  rules: TemplateRule[]
+  user_count?: number
+}
+export interface SubscriptionTemplateBody {
+  name: string
+  enabled: boolean
+  include_all: boolean
+  rules: TemplateRule[]
+}
+export const listSubscriptionTemplates = (signal?: AbortSignal) =>
+  http.get<{ templates: SubscriptionTemplate[] }>('/api/admin/subscription-templates', { signal }).then((r) => r.data.templates)
+export const createSubscriptionTemplate = (body: SubscriptionTemplateBody) =>
+  http.post<{ template: SubscriptionTemplate }>('/api/admin/subscription-templates', body).then((r) => r.data.template)
+export const updateSubscriptionTemplate = (id: number, body: SubscriptionTemplateBody) =>
+  http.put<{ template: SubscriptionTemplate }>(`/api/admin/subscription-templates/${id}`, body).then((r) => r.data.template)
+export const deleteSubscriptionTemplate = (id: number) =>
+  http.delete(`/api/admin/subscription-templates/${id}`).then((r) => r.data)
 
 // ---- admin: panel maintenance（面板设置：版本更新 + 数据备份）----
 export interface MaintenanceInfo {

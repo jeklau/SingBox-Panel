@@ -16,6 +16,7 @@ const Traffic = lazy(() => import('./features/admin/traffic/Traffic'))
 const Logs = lazy(() => import('./features/admin/logs/Logs'))
 const Users = lazy(() => import('./features/admin/users/UsersPage'))
 const UserDetail = lazy(() => import('./features/admin/users/UserDetail'))
+const SubscriptionTemplates = lazy(() => import('./features/admin/templates/SubscriptionTemplates'))
 const Settings = lazy(() => import('./features/admin/settings/Settings'))
 const Dashboard = lazy(() => import('./features/user/Dashboard'))
 
@@ -96,7 +97,8 @@ export default function App() {
           <Route path="/admin/users/:id" element={<AdminGuard><UserDetail /></AdminGuard>} />
           <Route path="/admin/logs" element={<AdminGuard><Logs /></AdminGuard>} />
           <Route path="/admin/external-nodes" element={<AdminGuard><ExternalNodes /></AdminGuard>} />
-          <Route path="/admin/settings" element={<AdminGuard><Settings /></AdminGuard>} />
+          <Route path="/admin/templates" element={<AdminGuard><SubscriptionTemplates /></AdminGuard>} />
+          <Route path="/admin/settings"element={<AdminGuard><Settings /></AdminGuard>} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

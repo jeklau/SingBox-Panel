@@ -46,12 +46,24 @@ func proxyUsersForInbound(db *gorm.DB, inbound *model.Inbound, settings singbox.
 	if err := db.Where("enabled = ?", true).Order("id").Find(&users).Error; err != nil {
 		return nil, err
 	}
+	templates, err := enabledTemplates(db)
+	if err != nil {
+		return nil, err
+	}
+	var server model.Server
+	if err := db.Select("id", "name", "region", "agent_token").First(&server, inbound.ServerID).Error; err != nil {
+		return nil, err
+	}
 	now := time.Now()
 	identities := make([]singbox.ProxyUser, 0, len(users))
 	trafficIdentities := make([]model.UserTrafficIdentity, 0, len(users))
 	for i := range users {
 		user := &users[i]
-		if user.Expired(now) || !user.HasInbound(inbound.ServerID, inbound.ID) {
+		var tpl *model.SubscriptionTemplate
+		if user.TemplateID != nil {
+			tpl = templates[*user.TemplateID]
+		}
+		if user.Expired(now) || !userInboundGranted(user, tpl, &server, inbound) {
 			continue
 		}
 		identity := proxyIdentity(user, inbound.ID)
@@ -70,10 +82,6 @@ func proxyUsersForInbound(db *gorm.DB, inbound *model.Inbound, settings singbox.
 		// single-credential mode. Keep one unissued credential so revoking the last
 		// real user never turns the listener into an open proxy. The Agent token is
 		// a stable server-side secret and is never exposed in subscriptions.
-		var server model.Server
-		if err := db.Select("agent_token").First(&server, inbound.ServerID).Error; err != nil {
-			return nil, err
-		}
 		if server.AgentToken == "" {
 			return nil, fmt.Errorf("server %d has no agent token for multi-user lockout credential", inbound.ServerID)
 		}

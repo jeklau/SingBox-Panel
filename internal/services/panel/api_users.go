@@ -36,6 +36,7 @@ type userReq struct {
 	InboundIDs []uint `json:"inbound_ids"` // empty = every inbound on those servers
 	ExpireAt   *int64 `json:"expire_at"`   // unix seconds; 0/null = never
 	Enabled    *bool  `json:"enabled"`
+	TemplateID *uint  `json:"template_id"` // update only: nil = unchanged, 0 = unbind
 }
 
 type userAccessReq struct {
@@ -759,6 +760,26 @@ func (a *App) updateUser(c *gin.Context) {
 		u.InboundIDs = normalizedIDs(req.InboundIDs)
 		accessChanged = true
 	}
+	templateChanged := false
+	if req.TemplateID != nil {
+		if *req.TemplateID == 0 {
+			u.TemplateID = nil
+		} else {
+			var cnt int64
+			if err := a.db.Model(&model.SubscriptionTemplate{}).Where("id = ?", *req.TemplateID).Count(&cnt).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			if cnt == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "template not found"})
+				return
+			}
+			tid := *req.TemplateID
+			u.TemplateID = &tid
+		}
+		columns = append(columns, "TemplateID")
+		templateChanged = true
+	}
 
 	// Validate the assigned node lists the same way updateUserAccess does, so an
 	// API client passing a stale/nonexistent ID gets a clear 400 instead of a
@@ -811,7 +832,13 @@ func (a *App) updateUser(c *gin.Context) {
 		return
 	}
 
-	a.refreshUserProxyAccess(oldServerIDs, u.ServerIDs)
+	if templateChanged {
+		// A template can reach any server, so every managed config may gain or
+		// lose this user's credentials.
+		a.refreshUserProxyAccess(oldServerIDs, u.ServerIDs, a.allServerIDs())
+	} else {
+		a.refreshUserProxyAccess(oldServerIDs, u.ServerIDs)
+	}
 	c.JSON(http.StatusOK, gin.H{"user": u})
 }
 

@@ -219,6 +219,12 @@ func (a *App) routes() *gin.Engine {
 		admin.PUT("/users/:id/access", a.updateUserAccess)
 		admin.DELETE("/users/:id", a.deleteUser)
 
+		// Subscription templates: rule-based node selection bound to users.
+		admin.GET("/subscription-templates", a.listSubscriptionTemplates)
+		admin.POST("/subscription-templates", a.createSubscriptionTemplate)
+		admin.PUT("/subscription-templates/:id", a.updateSubscriptionTemplate)
+		admin.DELETE("/subscription-templates/:id", a.deleteSubscriptionTemplate)
+
 		// Hand-added external nodes merged into subscriptions (not managed here).
 		admin.GET("/custom-nodes", a.listCustomNodes)
 		admin.POST("/custom-nodes", a.createCustomNode)

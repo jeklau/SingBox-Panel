@@ -6,6 +6,8 @@ import '../../styles/settings-user.css'
 const CLIENTS = [
   { kind: 'surge', label: 'Surge', logo: 'surge.png', target: 'surge' },
   { kind: 'clashmeta', label: 'ClashMeta', logo: 'clashmeta.png', target: 'clash' },
+  // Full mihomo config with the built-in 10 policy groups and routing rules.
+  { kind: 'clashmeta-rules', label: 'ClashMeta 内置规则', logo: 'clashmeta.png', target: 'clash&preset=builtin' },
   { kind: 'shadowrocket', label: 'Shadowrocket', logo: 'shadowrocket.png', target: 'shadowrocket' },
 ]
 

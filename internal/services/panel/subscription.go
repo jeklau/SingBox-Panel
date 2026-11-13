@@ -791,8 +791,16 @@ func (a *App) writeSingbox(c *gin.Context, nodes []node) {
 }
 
 func (a *App) writeClash(c *gin.Context, nodes []node) {
-	proxies, _ := clashProxies(nodes)
-	// Only the proxies array: rules/groups belong to the user's own config.
+	proxies, names := clashProxies(nodes)
+	// preset=builtin opts in to a full config with policy groups and rules; a
+	// subscription without nodes keeps the bare list since empty groups are invalid.
+	if c.Query("preset") == "builtin" && len(names) > 0 {
+		if data, err := marshalClashPreset(proxies, names); err == nil {
+			c.Data(http.StatusOK, "text/yaml; charset=utf-8", data)
+			return
+		}
+	}
+	// Otherwise only the proxies array: rules/groups belong to the user's own config.
 	data, _ := marshalClashProxiesYAML(proxies)
 	c.Data(http.StatusOK, "text/yaml; charset=utf-8", data)
 }

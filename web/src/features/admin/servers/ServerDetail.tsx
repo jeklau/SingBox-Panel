@@ -22,6 +22,7 @@ import {
   RotateCw,
 } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
+import { presetGroupSummary } from '../presetGroups'
 import {
   applyRawConfig,
   deleteInbound,
@@ -770,7 +771,7 @@ export default function ServerDetail() {
   const inboundTable = (
     <Table
       rowKey="id"
-      scroll={{ x: 560 }}
+      scroll={{ x: 720 }}
       dataSource={server.inbounds || []}
       locale={{ emptyText: '暂无入站' }}
       rowClassName={(ib: Inbound) => (ib.enabled === false ? 'is-disabled' : '')}
@@ -779,6 +780,10 @@ export default function ServerDetail() {
         { title: '协议', dataIndex: 'type', render: (v: string) => <ProtocolTag type={v} /> },
         { title: '端口', dataIndex: 'listen_port', render: (v: number) => <span className="mono">{v}</span> },
         { title: '用户', render: (_, ib: Inbound) => <span className="muted">{ib.settings?.multi_user ? '多用户' : '单用户'}</span> },
+        { title: '分流', width: 160, ellipsis: true, render: (_, ib: Inbound) => {
+          const summary = presetGroupSummary(ib.preset_groups)
+          return <span className={summary === '全部分流' ? 'faint' : 'muted'} title={summary}>{summary}</span>
+        } },
         { title: '', width: 88, align: 'right', render: (_, ib: Inbound) => rowActions(() => { setEditing(ib); setFormOpen(true) }, () => onDeleteInbound(ib), `入站 ${ib.tag}`) },
       ]}
     />

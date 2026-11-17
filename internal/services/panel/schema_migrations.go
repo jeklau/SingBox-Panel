@@ -400,6 +400,11 @@ var applicationMigrations = []schemaMigration{
 		name:    "per-user traffic quota",
 		up:      func(tx *gorm.DB) error { return tx.AutoMigrate(&model.User{}) },
 	},
+	{
+		version: 35,
+		name:    "per-node clash preset groups",
+		up:      func(tx *gorm.DB) error { return tx.AutoMigrate(&model.Inbound{}, &model.CustomNode{}) },
+	},
 }
 
 // migrationReplaySafe records whether an interrupted attempt of each migration
@@ -453,6 +458,7 @@ var migrationReplaySafe = map[uint]bool{
 	32: true,  // AutoMigrate adds nullable outbound source columns
 	33: true,  // AutoMigrate adds the template table and a nullable users.template_id
 	34: true,  // AutoMigrate adds defaulted quota columns to users
+	35: true,  // AutoMigrate adds preset group columns to inbounds and custom nodes
 }
 
 // runSchemaMigrations applies every pending migration in order. If any

@@ -938,12 +938,13 @@ func (a *App) setConfigMode(c *gin.Context) {
 // ---------- inbounds ----------
 
 type inboundReq struct {
-	Type       string          `json:"type"`
-	Tag        string          `json:"tag"`
-	ListenPort int             `json:"listen_port"`
-	Settings   json.RawMessage `json:"settings"`
-	Remark     *string         `json:"remark"`
-	Enabled    *bool           `json:"enabled"`
+	Type         string          `json:"type"`
+	Tag          string          `json:"tag"`
+	ListenPort   int             `json:"listen_port"`
+	Settings     json.RawMessage `json:"settings"`
+	Remark       *string         `json:"remark"`
+	Enabled      *bool           `json:"enabled"`
+	PresetGroups *[]string       `json:"preset_groups"`
 }
 
 func (a *App) listInbounds(c *gin.Context) {
@@ -1026,14 +1027,24 @@ func (a *App) createInbound(c *gin.Context) {
 	if req.Remark != nil {
 		remark = *req.Remark
 	}
+	var presetGroups []string
+	if req.PresetGroups != nil {
+		normalized, err := normalizePresetGroups(*req.PresetGroups)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		presetGroups = normalized
+	}
 	ib := &model.Inbound{
-		ServerID:   id,
-		Type:       model.InboundType(req.Type),
-		Tag:        tag,
-		ListenPort: req.ListenPort,
-		Settings:   model.JSONText(raw),
-		Remark:     remark,
-		Enabled:    enabled,
+		ServerID:     id,
+		Type:         model.InboundType(req.Type),
+		Tag:          tag,
+		ListenPort:   req.ListenPort,
+		Settings:     model.JSONText(raw),
+		Remark:       remark,
+		Enabled:      enabled,
+		PresetGroups: presetGroups,
 	}
 	if err := a.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(ib).Error; err != nil {
@@ -1091,6 +1102,14 @@ func (a *App) updateInbound(c *gin.Context) {
 	ib.ListenPort = nextPort
 	if req.Remark != nil {
 		ib.Remark = *req.Remark
+	}
+	if req.PresetGroups != nil {
+		normalized, err := normalizePresetGroups(*req.PresetGroups)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		ib.PresetGroups = normalized
 	}
 	if req.Enabled != nil {
 		if !*req.Enabled && ib.Enabled {

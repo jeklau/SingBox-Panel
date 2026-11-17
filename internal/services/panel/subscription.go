@@ -21,17 +21,18 @@ import (
 
 // node bundles a server+inbound for a subscriber.
 type node struct {
-	orderType string
-	orderID   uint
-	tag       string
-	name      string
-	server    string
-	port      int
-	typ       string
-	region    string // ISO-ish region code (US/HK/JP…) for the dashboard map; may be empty
-	settings  singbox.InboundSettings
-	user      singbox.ProxyUser
-	udp       *bool // nil keeps the historical default: UDP enabled
+	orderType    string
+	orderID      uint
+	tag          string
+	name         string
+	server       string
+	port         int
+	typ          string
+	region       string // ISO-ish region code (US/HK/JP…) for the dashboard map; may be empty
+	settings     singbox.InboundSettings
+	user         singbox.ProxyUser
+	udp          *bool // nil keeps the historical default: UDP enabled
+	presetGroups []string
 }
 
 func (n node) udpEnabled() bool {
@@ -229,15 +230,16 @@ func (a *App) gatherNodesWithError(user *model.User) ([]node, error) {
 					identity = st.SingleUserIdentity()
 				}
 				batch = append(batch, node{
-					orderType: userNodeTypeManaged,
-					orderID:   ib.ID,
-					tag:       ib.Tag,
-					server:    host,
-					port:      ib.ListenPort,
-					typ:       string(ib.Type),
-					region:    srv.Region,
-					settings:  st,
-					user:      identity,
+					orderType:    userNodeTypeManaged,
+					orderID:      ib.ID,
+					tag:          ib.Tag,
+					server:       host,
+					port:         ib.ListenPort,
+					typ:          string(ib.Type),
+					region:       srv.Region,
+					settings:     st,
+					user:         identity,
+					presetGroups: ib.PresetGroups,
 				})
 			}
 			nameServerNodes(srv.Name, batch)
@@ -333,13 +335,14 @@ func (a *App) customNodeToNode(c *model.CustomNode) (node, bool) {
 			cn.Name = c.Name
 		}
 		return node{
-			name:     cn.Name,
-			server:   cn.Server,
-			port:     cn.ServerPort,
-			typ:      cn.Type,
-			region:   regionFromName(cn.Name),
-			settings: cn.Settings,
-			user:     cn.User,
+			name:         cn.Name,
+			server:       cn.Server,
+			port:         cn.ServerPort,
+			typ:          cn.Type,
+			region:       regionFromName(cn.Name),
+			settings:     cn.Settings,
+			user:         cn.User,
+			presetGroups: c.PresetGroups,
 		}, true
 	}
 
@@ -565,14 +568,15 @@ func (a *App) customNodeToNode(c *model.CustomNode) (node, bool) {
 		return node{}, false
 	}
 	return node{
-		name:     name,
-		server:   c.Address,
-		port:     c.Port,
-		typ:      protocol,
-		region:   regionFromName(name),
-		settings: st,
-		user:     u,
-		udp:      p.UDP,
+		name:         name,
+		server:       c.Address,
+		port:         c.Port,
+		typ:          protocol,
+		region:       regionFromName(name),
+		settings:     st,
+		user:         u,
+		udp:          p.UDP,
+		presetGroups: c.PresetGroups,
 	}, true
 }
 
@@ -791,11 +795,11 @@ func (a *App) writeSingbox(c *gin.Context, nodes []node) {
 }
 
 func (a *App) writeClash(c *gin.Context, nodes []node) {
-	proxies, names := clashProxies(nodes)
+	proxies, members := clashProxies(nodes)
 	// preset=builtin opts in to a full config with policy groups and rules; a
 	// subscription without nodes keeps the bare list since empty groups are invalid.
-	if c.Query("preset") == "builtin" && len(names) > 0 {
-		if data, err := marshalClashPreset(proxies, names); err == nil {
+	if c.Query("preset") == "builtin" && len(members) > 0 {
+		if data, err := marshalClashPreset(proxies, members); err == nil {
 			c.Data(http.StatusOK, "text/yaml; charset=utf-8", data)
 			return
 		}
@@ -892,7 +896,7 @@ func clashProxyKeyListed(keys []string, target string) bool {
 	return false
 }
 
-func clashProxies(nodes []node) (proxies []map[string]any, names []string) {
+func clashProxies(nodes []node) (proxies []map[string]any, members []clashPresetMember) {
 	seen := map[string]int{}
 	for _, n := range nodes {
 		p := clashProxy(n, seen)
@@ -900,9 +904,9 @@ func clashProxies(nodes []node) (proxies []map[string]any, names []string) {
 			continue
 		}
 		proxies = append(proxies, p)
-		names = append(names, p["name"].(string))
+		members = append(members, clashPresetMember{Name: p["name"].(string), Groups: n.presetGroups})
 	}
-	return proxies, names
+	return proxies, members
 }
 
 func shadowrocketProxies(nodes []node) (proxies []map[string]any, names []string) {

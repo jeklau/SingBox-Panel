@@ -326,6 +326,7 @@ export interface Inbound {
   enabled: boolean
   settings: InboundSettings
   remark: string
+  preset_groups?: string[]
   created_at: string
   updated_at: string
 }

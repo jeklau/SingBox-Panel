@@ -183,6 +183,7 @@ interface InboundBody {
   settings?: InboundSettings
   remark?: string
   enabled?: boolean
+  preset_groups?: string[]
 }
 export const createInbound = (serverId: number, body: InboundBody) =>
   http.post<{ inbound: Inbound } & ConfigApplyResult>(`/api/admin/servers/${serverId}/inbounds`, body).then((r) => r.data)
@@ -423,6 +424,7 @@ export interface CustomNode {
   params: Record<string, unknown> | null
   enabled: boolean
   sort_order: number
+  preset_groups?: string[]
   subscription_id?: number | null
   detail?: {
     protocol: string
@@ -446,6 +448,7 @@ export interface CustomNodeBody {
   excluded_user_ids?: number[]
   enabled?: boolean
   sort_order?: number
+  preset_groups?: string[]
 }
 export const listCustomNodes = (signal?: AbortSignal) =>
   http.get<{ nodes: CustomNode[] }>('/api/admin/custom-nodes', { signal }).then((r) => r.data.nodes)

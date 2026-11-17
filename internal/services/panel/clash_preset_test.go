@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goccy/go-yaml"
@@ -8,7 +9,7 @@ import (
 
 func TestClashPresetStructure(t *testing.T) {
 	proxies := []map[string]any{{"name": "tokyo", "type": "ss", "server": "1.1.1.1", "port": 1}}
-	data, err := marshalClashPreset(proxies, []string{"tokyo"})
+	data, err := marshalClashPreset(proxies, []clashPresetMember{{Name: "tokyo"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +53,89 @@ func TestClashPresetStructure(t *testing.T) {
 		if !known[target] {
 			t.Errorf("rule %q targets unknown group %q", r, target)
 		}
+	}
+}
+
+func TestClashPresetAssignsNodesToSelectedGroups(t *testing.T) {
+	proxies := []map[string]any{
+		{"name": "ai-only", "type": "ss", "server": "1.1.1.1", "port": 1},
+		{"name": "everywhere", "type": "ss", "server": "1.0.0.1", "port": 1},
+	}
+	data, err := marshalClashPreset(proxies, []clashPresetMember{
+		{Name: "ai-only", Groups: []string{"ai"}},
+		{Name: "everywhere"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Proxies []struct {
+			Name string `yaml:"name"`
+		} `yaml:"proxies"`
+		Groups []struct {
+			Name    string   `yaml:"name"`
+			Type    string   `yaml:"type"`
+			Proxies []string `yaml:"proxies"`
+		} `yaml:"proxy-groups"`
+	}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Proxies) != 2 {
+		t.Fatalf("proxies = %d, want both nodes in the proxy list", len(doc.Proxies))
+	}
+	byName := map[string][]string{}
+	for _, group := range doc.Groups {
+		byName[group.Name] = group.Proxies
+		if group.Type == "url-test" || group.Type == "fallback" {
+			for _, proxy := range group.Proxies {
+				if proxy == "ai-only" {
+					t.Errorf("%s includes ai-only", group.Name)
+				}
+			}
+		}
+	}
+	contains := func(group, name string) bool {
+		for _, proxy := range byName[group] {
+			if proxy == name {
+				return true
+			}
+		}
+		return false
+	}
+	if !contains(grpAI, "ai-only") {
+		t.Fatalf("AI group = %v, want ai-only", byName[grpAI])
+	}
+	for _, group := range []string{grpSelect, grpApple, grpGoogle, grpTelegram, grpFinal} {
+		if contains(group, "ai-only") {
+			t.Errorf("%s includes ai-only: %v", group, byName[group])
+		}
+		if !contains(group, "everywhere") {
+			t.Errorf("%s missing everywhere: %v", group, byName[group])
+		}
+	}
+	if _, ok := byName[grpAuto]; !ok {
+		t.Fatal("url-test group missing while an unrestricted node remains")
+	}
+}
+
+func TestNormalizePresetGroups(t *testing.T) {
+	all, err := normalizePresetGroups([]string{" AI ", "ai", "select", "auto", "fallback", "apple", "google", "telegram", "final"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("full selection = %v, want empty (every group)", all)
+	}
+	got, err := normalizePresetGroups([]string{"telegram", "ai", "ai"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "ai,telegram" {
+		t.Fatalf("groups = %v", got)
+	}
+	if _, err := normalizePresetGroups([]string{"nope"}); err == nil {
+		t.Fatal("unknown group accepted")
 	}
 }
 

@@ -51,6 +51,7 @@ import type { Inbound, Server } from '../../../types'
 import { RegionFlag, regionCodeFromFlag, removeRegionFlag } from '../../../components/RegionFlag'
 import { SHADOWSOCKS_METHODS } from '../../../util'
 import { RequestState } from '../../../components/RequestState'
+import { PresetGroupFields, presetFormValues, presetGroupSummary, presetGroupsFromForm } from '../presetGroups'
 import { buildCustomNodeParams } from '../../../customNodeForm'
 import { Pills, Status } from '../../../ui/Page'
 import '../../../styles/users.css'
@@ -977,7 +978,7 @@ export function CustomNodesPanel({ nodes, loading, error, onNodesChange }: {
   const openNodeCreate = () => {
     setEditingNode(null)
     nodeForm.resetFields()
-    nodeForm.setFieldsValue({ enabled: true, link: '', tls_mode: 'tls', transport: 'tcp', snell_version: 5, snell_obfs_mode: 'none', snell_mode: '', method: '2022-blake3-aes-128-gcm', group: '' })
+    nodeForm.setFieldsValue({ enabled: true, link: '', tls_mode: 'tls', transport: 'tcp', snell_version: 5, snell_obfs_mode: 'none', snell_mode: '', method: '2022-blake3-aes-128-gcm', group: '', ...presetFormValues() })
     setNodeOpen(true)
   }
 
@@ -1135,6 +1136,7 @@ export function CustomNodesPanel({ nodes, loading, error, onNodesChange }: {
       username: p.username,
       all_users: n.all_users,
       enabled: n.enabled,
+      ...presetFormValues(n.preset_groups),
     })
     setNodeOpen(true)
   }
@@ -1155,6 +1157,7 @@ export function CustomNodesPanel({ nodes, loading, error, onNodesChange }: {
       excluded_user_ids: editingNode && editingNode.all_users ? editingNode.excluded_user_ids ?? [] : [],
       enabled: v.enabled !== false,
       sort_order: editingNode?.sort_order ?? 0,
+      preset_groups: presetGroupsFromForm(!!v.preset_all, v.preset_groups),
     }
       if (normalizedNodeLink) {
         const sameLink = editingNode?.link === normalizedNodeLink
@@ -1337,6 +1340,15 @@ export function CustomNodesPanel({ nodes, loading, error, onNodesChange }: {
       ),
     },
     {
+      title: '分流',
+      width: 160,
+      ellipsis: true,
+      render: (_: unknown, n: CustomNode) => {
+        const summary = presetGroupSummary(n.preset_groups)
+        return <span className={summary === '全部分流' ? 'faint' : 'muted'} title={summary}>{summary}</span>
+      },
+    },
+    {
       title: '类型',
       width: 110,
       render: (_: unknown, n: CustomNode) => {
@@ -1506,7 +1518,7 @@ export function CustomNodesPanel({ nodes, loading, error, onNodesChange }: {
             dataSource={filteredNodes}
             virtual={filteredNodes.length > 20}
             tableLayout="fixed"
-            scroll={{ x: 900, y: filteredNodes.length > 20 ? 560 : undefined }}
+            scroll={{ x: 1060, y: filteredNodes.length > 20 ? 560 : undefined }}
             columns={nodeColumns}
             onRow={(node) => ({
               className: 'um-clickable-row',
@@ -1631,6 +1643,7 @@ export function CustomNodesPanel({ nodes, loading, error, onNodesChange }: {
           <dl className="ui-kv ui-card um-detail">
             <div><dt>来源</dt><dd>{detailNode.subscription_id ? `订阅 · ${detailSubscription?.name || `#${detailNode.subscription_id}`}` : '手动添加'}</dd></div>
             <div><dt>分组</dt><dd>{detailNode.group?.trim() || '未分组'}</dd></div>
+            <div><dt>分流</dt><dd>{presetGroupSummary(detailNode.preset_groups)}</dd></div>
             <div><dt>协议</dt><dd>{detailNode.detail?.protocol || detailNode.protocol || protocolOf(detailNode.link || '')}</dd></div>
             <div><dt>服务器</dt><dd className="mono">{nodeAddress(detailNode) || '—'}</dd></div>
             <div>
@@ -1673,6 +1686,10 @@ export function CustomNodesPanel({ nodes, loading, error, onNodesChange }: {
               filterOption={(input, option) => (option?.value ?? '').toLowerCase().includes(input.toLowerCase())}
             />
           </Form.Item>
+          <div className="um-form-group">
+            <h4>分流</h4>
+            <PresetGroupFields form={nodeForm} />
+          </div>
           <Form.Item name="link" label="URI 链接">
             <Input.TextArea
               placeholder="支持 vless://、http:// 等节点 URI"

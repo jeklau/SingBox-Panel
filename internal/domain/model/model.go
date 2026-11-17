@@ -263,6 +263,9 @@ type Inbound struct {
 	Enabled    bool        `gorm:"index" json:"enabled"`
 	Settings   JSONText    `gorm:"type:text" json:"settings"`
 	Remark     string      `gorm:"size:255" json:"remark"`
+	// PresetGroups limits which built-in Clash policy groups include this
+	// inbound. Empty means every group, which is the historical behaviour.
+	PresetGroups []string `gorm:"serializer:json" json:"preset_groups"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -462,6 +465,9 @@ type CustomNode struct {
 	// removing the filter restores its stable row and per-user assignments.
 	// Manual nodes never set this field.
 	HiddenBySubscriptionRule bool `gorm:"index;not null;default:false" json:"-"`
+	// PresetGroups limits which built-in Clash policy groups include this node.
+	// Empty means every group.
+	PresetGroups []string `gorm:"serializer:json" json:"preset_groups"`
 	// SubscriptionID/SubscriptionKey are set only for nodes managed by a saved
 	// remote subscription. Manual nodes keep both fields empty. The key is stable
 	// within one subscription and lets refreshes update rows without losing their

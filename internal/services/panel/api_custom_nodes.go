@@ -30,6 +30,7 @@ type customNodeReq struct {
 	ExcludedUserIDs *[]uint         `json:"excluded_user_ids"`
 	Enabled         *bool           `json:"enabled"`
 	SortOrder       *int            `json:"sort_order"`
+	PresetGroups    *[]string       `json:"preset_groups"`
 }
 
 type customNodeRow struct {
@@ -254,6 +255,14 @@ func (a *App) createCustomNode(c *gin.Context) {
 	if req.SortOrder != nil {
 		node.SortOrder = *req.SortOrder
 	}
+	if req.PresetGroups != nil {
+		groups, err := normalizePresetGroups(*req.PresetGroups)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		node.PresetGroups = groups
+	}
 	unlockAudience := a.subscriptionManager().lockAudience()
 	defer unlockAudience()
 	if err := a.db.Transaction(func(tx *gorm.DB) error {
@@ -375,6 +384,15 @@ func (a *App) updateCustomNode(c *gin.Context) {
 	if req.SortOrder != nil {
 		node.SortOrder = *req.SortOrder
 		columns = append(columns, "SortOrder")
+	}
+	if req.PresetGroups != nil {
+		groups, err := normalizePresetGroups(*req.PresetGroups)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		node.PresetGroups = groups
+		columns = append(columns, "PresetGroups")
 	}
 	if err := a.db.Model(&model.CustomNode{}).Where("id = ?", node.ID).Select(columns).Updates(&node).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

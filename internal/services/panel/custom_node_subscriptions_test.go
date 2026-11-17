@@ -363,6 +363,7 @@ func TestUpdateCustomNodeSubscriptionAppliesSourceSettings(t *testing.T) {
 	node := model.CustomNode{
 		Name: "节点", Link: "socks5://127.0.0.1:1080", Group: source.Group,
 		Enabled: true, SortOrder: 23, SubscriptionID: &source.ID, SubscriptionKey: "node-key",
+		PresetGroups: []string{"ai"},
 	}
 	if err := db.Create(&node).Error; err != nil {
 		t.Fatal(err)
@@ -397,6 +398,9 @@ func TestUpdateCustomNodeSubscriptionAppliesSourceSettings(t *testing.T) {
 	}
 	if node.Group != "新分组" || node.Enabled || node.SortOrder != 33 {
 		t.Fatalf("managed node settings not updated: %+v", node)
+	}
+	if len(node.PresetGroups) != 1 || node.PresetGroups[0] != "ai" {
+		t.Fatalf("subscription update cleared preset groups: %v", node.PresetGroups)
 	}
 }
 

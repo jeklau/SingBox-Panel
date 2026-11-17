@@ -4,6 +4,7 @@ import { createInbound, updateInbound } from '../../../api'
 import { applyWithToast } from '../../../configApply'
 import type { Inbound, InboundSettings, InboundType, RealityGuardSettings, RealitySettings } from '../../../types'
 import { randomBase64, randomHex, randomUUID, SHADOWSOCKS_METHODS, ss2022KeyLen } from '../../../util'
+import { PresetGroupFields, presetFormValues, presetGroupsFromForm } from '../presetGroups'
 import '../../../styles/forms.css'
 import '../../../styles/inbound-editor.css'
 
@@ -147,6 +148,7 @@ export function toForm(ib: Inbound | null): FormVals {
       snell_obfs_mode: 'none',
       snell_mode: '',
       multi_user: false,
+      ...presetFormValues(),
     }
   }
   const s = ib.settings || {}
@@ -161,6 +163,7 @@ export function toForm(ib: Inbound | null): FormVals {
     tag: ib.tag,
     listen_port: ib.listen_port,
     enabled: ib.enabled,
+    ...presetFormValues(ib.preset_groups),
     // Keep invalid ChaCha opt-ins visible until the administrator fixes them.
     multi_user: !!s.multi_user && (supportsMultiUser(ib.type, s.method) || (ib.type === 'shadowsocks' && s.method === SS2022_CHACHA_METHOD)),
     username: s.username ?? '',
@@ -458,6 +461,7 @@ export default function InboundForm({
         // Inbounds are always active; remove one instead of pausing it.
         enabled: true,
         settings,
+        preset_groups: presetGroupsFromForm(!!v.preset_all, v.preset_groups),
       }
       if (preview) {
         onPreview?.(body)
@@ -1029,6 +1033,12 @@ export default function InboundForm({
             )}
           </FormGroup>
         )}
+        <section className="fm-group fm-group-basic">
+          <h3 className="fm-group-title">分流<small>Clash 内置规则</small></h3>
+          <div className="fm-grid" data-panel="inbound">
+            <PresetGroupFields form={form} />
+          </div>
+        </section>
       </Form>
       </fieldset>
     </Modal>

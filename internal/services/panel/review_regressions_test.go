@@ -130,8 +130,11 @@ func TestSubscriptionsAvoidGeneratedAndReservedNameCollisions(t *testing.T) {
 	for _, name := range []string{"HK", "HK", "HK-2", "HK", "HK-2-2", "auto", "proxy", "direct"} {
 		nodes = append(nodes, node{name: name, typ: "socks", server: "example.com", port: 1080})
 	}
-	for _, render := range []func([]node) ([]map[string]any, []string){clashProxies, shadowrocketProxies} {
-		proxies, _ := render(nodes)
+	for _, render := range []func([]node) []map[string]any{
+		func(nodes []node) []map[string]any { proxies, _ := clashProxies(nodes); return proxies },
+		func(nodes []node) []map[string]any { proxies, _ := shadowrocketProxies(nodes); return proxies },
+	} {
+		proxies := render(nodes)
 		seen := map[string]bool{}
 		for _, proxy := range proxies {
 			name := proxy["name"].(string)

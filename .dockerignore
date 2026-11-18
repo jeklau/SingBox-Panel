@@ -6,8 +6,11 @@
 !cmd/**
 !internal/
 !internal/**
+!agent/
+!agent/**
 !web/
 !web/**
+agent/target
 web/node_modules
 web/dist
 web/.env*

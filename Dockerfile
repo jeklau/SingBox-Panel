@@ -6,11 +6,29 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
+FROM --platform=$BUILDPLATFORM rust:1-bookworm AS agent
+WORKDIR /src
+RUN apt-get update && apt-get install -y --no-install-recommends xz-utils curl ca-certificates && \
+    curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+      | tar -xJ -C /usr/local && \
+    ln -sf /usr/local/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig && \
+    cargo install --locked cargo-zigbuild && \
+    rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+COPY agent/ ./agent/
+ARG AGENT_VERSION=
+RUN AGENT_VER="${AGENT_VERSION:-$(cat agent/VERSION)}" && \
+    mkdir -p /out/agents && cp agent/VERSION /out/agents/VERSION && \
+    cd agent && AGENT_VERSION="$AGENT_VER" cargo zigbuild --release --target x86_64-unknown-linux-musl && \
+    AGENT_VERSION="$AGENT_VER" cargo zigbuild --release --target aarch64-unknown-linux-musl && \
+    cp target/x86_64-unknown-linux-musl/release/singbox-panel-agent /out/agents/singbox-panel-agent-linux-amd64 && \
+    cp target/aarch64-unknown-linux-musl/release/singbox-panel-agent /out/agents/singbox-panel-agent-linux-arm64 && \
+    chmod 755 /out/agents/singbox-panel-agent-linux-*
+
 FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS backend
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY cmd/ ./cmd/
+COPY cmd/panel/ ./cmd/panel/
 COPY internal/ ./internal/
 ARG TARGETOS
 ARG TARGETARCH
@@ -20,15 +38,6 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath -buildvcs=false -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
     -o /out/singbox-panel ./cmd/panel
-# Every panel serves both architectures, regardless of its own architecture.
-# Agents still install as native systemd services on their target VPSes.
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    mkdir -p /out/agents && cp cmd/agent/VERSION /out/agents/VERSION && \
-    for arch in amd64 arm64; do \
-      CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -buildvcs=false \
-        -ldflags "-s -w -X main.version=$(cat cmd/agent/VERSION)" \
-        -o /out/agents/singbox-panel-agent-linux-$arch ./cmd/agent || exit 1; \
-    done
 
 FROM alpine:3.23 AS runtime
 RUN apk add --no-cache ca-certificates && \
@@ -36,7 +45,7 @@ RUN apk add --no-cache ca-certificates && \
     mkdir -p /app/data && chown 10001:10001 /app/data
 WORKDIR /app
 COPY --from=backend /out/singbox-panel /usr/local/bin/singbox-panel
-COPY --from=backend /out/agents/ /app/agents/
+COPY --from=agent /out/agents/ /app/agents/
 COPY --from=web /src/web/dist/ /app/web/
 ENV SINGBOX_PANEL_DEPLOYMENT=docker \
     SINGBOX_PANEL_LISTEN=:8080 \

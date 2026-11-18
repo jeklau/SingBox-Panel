@@ -1,9 +1,10 @@
 # build output
 /dist/
 /web/dist/
-/agent
+/singbox-panel-agent
 /panel
 /singbox-panel
+/agent/target/
 
 # runtime data
 /data/

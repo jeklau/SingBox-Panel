@@ -40,10 +40,14 @@ jobs:
           go-version: '1.26.6'
           cache: true
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Check backend
         run: |
           go test ./...
           go vet ./...
+          cd agent && cargo test
 
       - name: Check frontend
         working-directory: web

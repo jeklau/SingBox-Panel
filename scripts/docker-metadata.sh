@@ -9,7 +9,7 @@ set -euo pipefail
 [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo 'Invalid repository' >&2; exit 1; }
 [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo 'Invalid commit SHA' >&2; exit 1; }
 image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-source_version="$(cat cmd/agent/VERSION)"
+source_version="$(cat agent/VERSION)"
 
 if [[ "$GITHUB_REF" == refs/heads/main ]]; then
   # Image aliases are separate from the application's version. The documented
@@ -20,7 +20,7 @@ if [[ "$GITHUB_REF" == refs/heads/main ]]; then
 elif [[ "$GITHUB_REF" =~ ^refs/tags/(v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?)$ ]]; then
   version="${GITHUB_REF#refs/tags/}"
   [[ ${#version} -le 128 && "$version" == "$source_version" ]] || {
-    echo 'Release tag must match cmd/agent/VERSION and fit a Docker tag' >&2
+    echo 'Release tag must match agent/VERSION and fit a Docker tag' >&2
     exit 1
   }
   primary_tag="$version"

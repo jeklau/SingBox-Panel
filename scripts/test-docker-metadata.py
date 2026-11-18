@@ -16,8 +16,8 @@ class DockerMetadataTest(unittest.TestCase):
     def metadata(self, ref, version="v1.2.3", repository="Example/SingBox-Panel", succeeds=True, event="push"):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
-            (root / "cmd/agent").mkdir(parents=True)
-            (root / "cmd/agent/VERSION").write_text(version + "\n")
+            (root / "agent").mkdir(parents=True)
+            (root / "agent/VERSION").write_text(version + "\n")
             output = root / "outputs"
             env = dict(os.environ, GITHUB_REF=ref, GITHUB_SHA=SHA, GITHUB_EVENT_NAME=event,
                        GITHUB_REPOSITORY=repository, GITHUB_OUTPUT=str(output))

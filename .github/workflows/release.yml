@@ -45,11 +45,24 @@ jobs:
           go-version: '1.26.6'
           cache: true
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      - name: Install zig and cargo-zigbuild
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | sudo tar -xJ -C /usr/local
+          sudo ln -sf /usr/local/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig
+          cargo install --locked cargo-zigbuild
+
       # 发版前先跑测试：标签一旦推上去就无法收回，构建失败好过发出坏包。
       - name: Test backend
         run: |
           go test ./...
           go vet ./...
+          cd agent && cargo test
 
       - name: Build frontend
         working-directory: web
@@ -79,22 +92,11 @@ jobs:
             -o dist/panel/singbox-panel-linux-arm64 \
             ./cmd/panel
 
-          AGENT_VER="$(cat cmd/agent/VERSION)"
+          AGENT_VER="$(cat agent/VERSION)"
           test "$AGENT_VER" = "$VERSION" || { echo 'Panel and Agent release versions must match' >&2; exit 1; }
           echo "${AGENT_VER}" > dist/agents/VERSION
-          echo "==> agent linux/amd64 (${AGENT_VER})"
-          GOOS=linux GOARCH=amd64 go build \
-            -trimpath -buildvcs=false \
-            -ldflags "-s -w -X main.version=${AGENT_VER}" \
-            -o dist/agents/singbox-panel-agent-linux-amd64 \
-            ./cmd/agent
-
-          echo "==> agent linux/arm64 (${AGENT_VER})"
-          GOOS=linux GOARCH=arm64 go build \
-            -trimpath -buildvcs=false \
-            -ldflags "-s -w -X main.version=${AGENT_VER}" \
-            -o dist/agents/singbox-panel-agent-linux-arm64 \
-            ./cmd/agent
+          echo "==> agent linux/amd64+arm64 (${AGENT_VER})"
+          AGENT_VERSION="${AGENT_VER}" make agents
 
       # 打包必须全部先于校验和计算，否则漏进 checksums.txt 的产物在安装时
       # 会静默跳过校验。

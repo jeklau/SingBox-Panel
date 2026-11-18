@@ -158,8 +158,8 @@ func (a *App) handleAgentDownload(c *gin.Context) {
 	path := filepath.Join(a.cfg.AgentsDir, "singbox-panel-agent-linux-"+arch)
 	if _, err := os.Stat(path); err != nil {
 		c.String(http.StatusNotFound,
-			"agent binary not found: %s\nBuild agents first: make agents (or GOOS=linux GOARCH=%s go build -o %s ./cmd/agent)",
-			path, arch, path)
+			"agent binary not found: %s\nBuild agents first: make agents",
+			path)
 		return
 	}
 	checksum, err := a.cachedFileChecksum(path)

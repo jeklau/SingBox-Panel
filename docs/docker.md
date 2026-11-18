@@ -212,7 +212,7 @@ docker compose ps
 | 推送预发布标签，如 `v1.2.3-rc.1` | 同上 | 仅该预发布版本，不更新 `latest` |
 | Actions 手动运行 `Publish Docker image` | 重新执行后端、前端及容器检查 | 按所选 `main` 或版本标签决定，其他分支拒绝发布 |
 
-正式发布的 Git 版本标签必须与 `cmd/agent/VERSION` 一致。镜像标签和应用版本号是两回事：`latest` 指向已通过检查的构建，镜像内部仍记录源码版本及提交后缀，而不是把程序版本改成 `latest`。`edge` 保留为主分支构建的兼容别名；预发布 Git 标签不更新 `latest`。PR 只运行检查，不登录 GHCR，也不发布镜像。
+正式发布的 Git 版本标签必须与 `agent/VERSION` 一致。镜像标签和应用版本号是两回事：`latest` 指向已通过检查的构建，镜像内部仍记录源码版本及提交后缀，而不是把程序版本改成 `latest`。`edge` 保留为主分支构建的兼容别名；预发布 Git 标签不更新 `latest`。PR 只运行检查，不登录 GHCR，也不发布镜像。
 
 手动发布 `latest` 时，在 Actions 中运行 **Publish Docker image**，选择 `main` 分支即可；不要创建名为 `latest` 的 Git 标签。发布后 CI 逐一检查目标镜像标签可查询，再生成部署附件。
 

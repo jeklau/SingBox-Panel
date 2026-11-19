@@ -15,7 +15,10 @@ use super::TrafficSampler;
 
 const STATS_STREAM_METHOD: &str = "/daemon.StartedService/SubscribeConnections";
 const STATS_STREAM_MAX_FRAME: u32 = 64 << 20;
-const STATS_STREAM_INTERVAL_MS: u64 = 1000;
+/// `daemon.SubscribeConnectionsRequest.interval` is a Go `time.Duration`
+/// (nanoseconds). Sending `1000` requests a 1 µs ticker in sing-box and
+/// saturates a CPU core.
+const STATS_STREAM_INTERVAL: Duration = Duration::from_secs(1);
 const STATS_STREAM_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const STATS_STREAM_STABLE_AFTER: Duration = Duration::from_secs(30);
 const STATS_STREAM_IDLE_RETRY: Duration = Duration::from_secs(15);
@@ -160,10 +163,7 @@ impl StatsStream {
     ) -> Result<(), StatsStreamError> {
         let raw = (self.read_config)().map_err(|_| StatsStreamError::Unavailable)?;
         let cfg = parse_stats_stream_config(&raw)?;
-        let mut request = Vec::new();
-        append_tag(&mut request, 1, WIRE_VARINT);
-        append_varint(&mut request, STATS_STREAM_INTERVAL_MS);
-        let body = grpc_web_frame(&request);
+        let body = subscribe_connections_request(STATS_STREAM_INTERVAL);
 
         let req = self
             .client
@@ -619,6 +619,14 @@ pub fn grpc_web_frame(message: &[u8]) -> Vec<u8> {
     frame
 }
 
+fn subscribe_connections_request(interval: Duration) -> Vec<u8> {
+    let nanos = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
+    let mut request = Vec::new();
+    append_tag(&mut request, 1, WIRE_VARINT);
+    append_varint(&mut request, nanos);
+    grpc_web_frame(&request)
+}
+
 #[cfg(test)]
 pub fn read_grpc_web_frame(r: &mut impl Read) -> Result<(Vec<u8>, bool), String> {
     let mut header = [0u8; 5];
@@ -892,5 +900,21 @@ mod tests {
             let port = s.pending_ports.get("in").cloned().unwrap();
             assert_eq!((port.upload, port.download), (40, 400));
         }
+    }
+
+    #[test]
+    fn subscribe_connections_request_encodes_nanoseconds() {
+        let frame = subscribe_connections_request(STATS_STREAM_INTERVAL);
+        let (payload, is_trailer) = read_grpc_web_frame(&mut Cursor::new(frame)).unwrap();
+        assert!(!is_trailer);
+        let mut interval = None;
+        walk_proto(&payload, |num, typ, _, varint| {
+            if num == 1 && typ == WIRE_VARINT {
+                interval = Some(varint);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(interval, Some(1_000_000_000));
     }
 }
